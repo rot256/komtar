@@ -1,0 +1,14 @@
+[project]
+name = "web-fifo-tests"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+dev = [
+  "playwright>=1.55",
+  "pytest>=8.4",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
