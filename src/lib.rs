@@ -48,7 +48,8 @@ impl FromStr for UpstreamUrl {
 #[command(
     name = "komtar",
     version,
-    about = "Queue browser feedback as JSON records in a FIFO"
+    about = "Queue browser feedback as JSON records in a FIFO",
+    after_help = "Workflow:\n  1. Run Komtar and open the printed URL.\n  2. Ask your agent to read .komtar.\n  3. Right-click the page and suggest edits.\n\nThe agent reads the FIFO. You point at the page and tell it what to change."
 )]
 pub struct Cli {
     /// Address on which komtar accepts browser requests.
@@ -87,7 +88,7 @@ pub async fn run(cli: Cli) -> Result<(), BoxError> {
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
 
     use super::{Cli, UpstreamUrl};
 
@@ -117,5 +118,12 @@ mod tests {
                 .parse::<UpstreamUrl>()
                 .is_err()
         );
+    }
+
+    #[test]
+    fn help_explains_the_agent_workflow() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("Ask your agent to read .komtar"));
+        assert!(help.contains("The agent reads the FIFO"));
     }
 }
