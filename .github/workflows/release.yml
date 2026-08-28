@@ -2,16 +2,80 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
-  workflow_dispatch:
+    branches:
+      - main
+    paths:
+      - Cargo.toml
 
 permissions:
   contents: read
 
 jobs:
+  metadata:
+    name: Read release version
+    runs-on: ubuntu-24.04
+    outputs:
+      publish: ${{ steps.package.outputs.publish }}
+      tag: ${{ steps.package.outputs.tag }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate package version
+        id: package
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "komtar") | .version')"
+          if [ -z "$version" ] || [ "$version" = "null" ]; then
+            echo "Could not read the komtar package version" >&2
+            exit 1
+          fi
+
+          previous_version="$(
+            git show "$BEFORE_SHA:Cargo.toml" |
+              awk '
+                /^\[package\]$/ { in_package = 1; next }
+                /^\[/ { in_package = 0 }
+                in_package && /^version[[:space:]]*=/ {
+                  value = $0
+                  sub(/^[^=]*=[[:space:]]*"/, "", value)
+                  sub(/".*$/, "", value)
+                  print value
+                  exit
+                }
+              '
+          )"
+
+          if [ "$version" = "$previous_version" ]; then
+            echo "Cargo.toml changed, but the package version remains $version"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Package version changed from $previous_version to $version"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Require a new version
+        if: steps.package.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.package.outputs.tag }}
+        run: |
+          if gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "$RELEASE_TAG already exists; bump the Cargo.toml version" >&2
+            exit 1
+          fi
+
   build:
     name: Build ${{ matrix.name }}
+    if: needs.metadata.outputs.publish == 'true'
+    needs: metadata
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -79,8 +143,10 @@ jobs:
 
   release:
     name: Publish GitHub release
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    if: needs.metadata.outputs.publish == 'true'
+    needs:
+      - metadata
+      - build
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -96,9 +162,30 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_SHA: ${{ github.sha }}
+          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
         run: |
-          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release create "$RELEASE_TAG" --title "$RELEASE_TAG" --generate-notes
+          if ! gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            tagged_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            tag_object="$(gh api --method POST "repos/$GH_REPO/git/tags" \
+              -f tag="$RELEASE_TAG" \
+              -f message="Release $RELEASE_TAG" \
+              -f object="$RELEASE_SHA" \
+              -f type=commit \
+              -f 'tagger[name]=github-actions[bot]' \
+              -f 'tagger[email]=41898282+github-actions[bot]@users.noreply.github.com' \
+              -f "tagger[date]=$tagged_at" \
+              --jq .sha)"
+            gh api --method POST "repos/$GH_REPO/git/refs" \
+              -f ref="refs/tags/$RELEASE_TAG" \
+              -f sha="$tag_object" >/dev/null
           fi
-          gh release upload "$RELEASE_TAG" dist/* --clobber
+
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" dist/* \
+              --verify-tag \
+              --title "$RELEASE_TAG" \
+              --generate-notes
+          else
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+          fi
