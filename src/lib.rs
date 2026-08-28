@@ -14,7 +14,7 @@ use crate::{
 };
 
 pub(crate) type BoxError = Box<dyn Error + Send + Sync>;
-pub(crate) const CLIENT_JS: &str = include_str!("client.js");
+pub(crate) const CLIENT_JS: &str = include_str!("../assets/client.js");
 
 #[derive(Debug, Parser)]
 #[command(

@@ -1,7 +1,7 @@
 # Repository instructions
 
 `komtar` is a development-only Rust reverse proxy. Keep the runtime as one
-self-contained binary: JavaScript and CSS belong in `src/client.js` and are
+self-contained binary: JavaScript and CSS belong in `assets/client.js` and are
 embedded with `include_str!`.
 
 Run the checks below before handing off changes:
