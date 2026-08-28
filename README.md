@@ -1,6 +1,22 @@
-# komtar
+# Komtar
 
-> Tell the agent what to change on the page. Stupid simple, works with any framework, single binary:
+Tell the agent what to change on the page.
+
+Stupid simple. Works with any framework. Single binary.
+
+## Installation
+
+Install with Cargo:
+
+```sh
+cargo install --git https://github.com/rot256/komtar
+```
+
+Or download a prebuilt static binary for macOS ARM64, Linux AMD64, or Linux ARM64
+from the [latest release](https://github.com/rot256/komtar/releases/latest), then
+place `komtar` somewhere on your `PATH`.
+
+## Usage
 
 Start your project's development server, then proxy it through Komtar:
 
@@ -15,11 +31,11 @@ Ask your coding agent to wait for queued suggestions:
 cat .komtar
 ```
 
-Right-click any element to suggest an edit. Select text before right-clicking to
-include that exact passage. Press Enter to queue the suggestion; Shift+Enter adds
-a newline.
+1. **Right-Click Any Element** — Open the edit suggestion box.
+2. **Select Text First** — Include the exact passage as context.
+3. **Press Enter to Submit** — Use Shift+Enter to add a newline.
 
-## Collaborative editing
+## Collaborative Editing
 
 Keep Komtar on loopback and expose it only to your tailnet:
 
