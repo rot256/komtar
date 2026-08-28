@@ -48,7 +48,6 @@ def wait_for_port(process: subprocess.Popen[str], port: int) -> None:
 
 class FixtureHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    fallback_script = ""
 
     def log_message(self, _format: str, *_args: object) -> None:
         pass
@@ -77,13 +76,6 @@ class FixtureHandler(BaseHTTPRequestHandler):
             self.send_header("Location", f"http://{address}:{port}/next")
             self.send_header("Content-Length", "0")
             self.end_headers()
-        elif self.path == "/fallback":
-            replacement = self.fallback_script.encode() + b"</body>"
-            self.send_bytes(
-                200,
-                "text/html; charset=utf-8",
-                FIXTURE_HTML.replace(b"</body>", replacement),
-            )
         else:
             self.send_bytes(404, "text/plain", b"missing")
 
@@ -135,11 +127,9 @@ def upstream_server():
 
 
 @contextmanager
-def komtar(command: str, fifo: Path, upstream: str | None = None):
+def komtar(fifo: Path, upstream: str):
     port = available_port()
-    arguments = [str(TARGET_DIR / "debug/komtar"), command]
-    if upstream is not None:
-        arguments.append(upstream)
+    arguments = [str(TARGET_DIR / "debug/komtar"), upstream]
     arguments.extend(["--listen", f"{HOST}:{port}", "--fifo", str(fifo)])
     process = subprocess.Popen(
         arguments,
@@ -183,7 +173,7 @@ def page(browser: Browser) -> Page:
 def test_proxy_injects_only_html_and_preserves_http_behavior() -> None:
     with tempfile.TemporaryDirectory() as temporary, upstream_server() as upstream:
         fifo = Path(temporary) / "comments.fifo"
-        with komtar("proxy", fifo, upstream) as proxy:
+        with komtar(fifo, upstream) as proxy:
             direct = urlopen(upstream).read()
             annotated = urlopen(proxy).read()
             assert b'id="komtar"' not in direct
@@ -211,7 +201,7 @@ def test_proxy_injects_only_html_and_preserves_http_behavior() -> None:
 def test_proxy_forwards_websocket_upgrades(page: Page) -> None:
     with tempfile.TemporaryDirectory() as temporary, upstream_server() as upstream:
         fifo = Path(temporary) / "comments.fifo"
-        with komtar("proxy", fifo, upstream) as proxy:
+        with komtar(fifo, upstream) as proxy:
             echoed = page.evaluate(
                 """(base) => new Promise((resolve, reject) => {
                   const socket = new WebSocket(base.replace('http:', 'ws:') + '/socket');
@@ -234,7 +224,7 @@ def test_browser_queues_selection_context_coordinates_and_multiple_edits(
 ) -> None:
     with tempfile.TemporaryDirectory() as temporary, upstream_server() as upstream:
         fifo = Path(temporary) / "comments.fifo"
-        with komtar("proxy", fifo, upstream) as proxy:
+        with komtar(fifo, upstream) as proxy:
             page.goto(proxy, wait_until="networkidle")
             expect(page.locator("#komtar")).to_be_attached()
             expect(page.locator("#komtar #badge")).to_have_text("0 queued")
@@ -293,7 +283,7 @@ def test_browser_queues_selection_context_coordinates_and_multiple_edits(
 def test_clicking_outside_closes_without_queueing(page: Page) -> None:
     with tempfile.TemporaryDirectory() as temporary, upstream_server() as upstream:
         fifo = Path(temporary) / "comments.fifo"
-        with komtar("proxy", fifo, upstream) as proxy:
+        with komtar(fifo, upstream) as proxy:
             page.goto(proxy, wait_until="networkidle")
             page.locator("#intro").click(button="right")
             dialog = page.locator("#komtar-dialog")
@@ -301,22 +291,3 @@ def test_clicking_outside_closes_without_queueing(page: Page) -> None:
             page.mouse.click(1, 1)
             expect(dialog).to_be_hidden()
             expect(page.locator("#komtar #badge")).to_have_text("0 queued")
-
-
-def test_script_tag_mode_allows_loopback_and_rejects_other_origins(page: Page) -> None:
-    with tempfile.TemporaryDirectory() as temporary, upstream_server() as upstream:
-        fifo = Path(temporary) / "comments.fifo"
-        with komtar("serve", fifo) as service:
-            FixtureHandler.fallback_script = (
-                f'<script type="module" src="{service}/_komtar/client.js"></script>'
-            )
-            page.goto(upstream + "/fallback", wait_until="networkidle")
-            expect(page.locator("#komtar")).to_be_attached()
-
-            request = Request(
-                service + "/_komtar/client.js",
-                headers={"Origin": "https://not-allowed.example"},
-            )
-            with pytest.raises(HTTPError) as raised:
-                urlopen(request)
-            assert raised.value.code == 403

@@ -15,6 +15,6 @@ cargo build --release
 ```
 
 Do not add production integration hooks. A project is annotated only when its
-developer deliberately visits the `komtar proxy` address or adds the documented
-development-only script tag. Preserve the version-1 newline-delimited JSON schema
-unless a breaking format change is explicitly requested.
+developer deliberately visits the address printed by `komtar`. Preserve the
+version-1 newline-delimited JSON schema unless a breaking format change is
+explicitly requested.

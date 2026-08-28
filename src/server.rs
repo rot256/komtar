@@ -1,24 +1,21 @@
-use std::{collections::HashSet, convert::Infallible, error::Error, net::IpAddr, sync::Arc};
+use std::{convert::Infallible, error::Error};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited, combinators::UnsyncBoxBody};
 use hyper::{
     Method, Request, Response, StatusCode, Uri,
     body::Incoming,
-    header::{
-        self, ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS,
-        ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_MAX_AGE, ALLOW, CACHE_CONTROL, CONTENT_LENGTH,
-        CONTENT_TYPE, ETAG, HOST, LOCATION, ORIGIN, VARY,
-    },
+    header::{self, ALLOW, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG, HOST, LOCATION},
     service::service_fn,
 };
+use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::{TokioExecutor, TokioIo},
 };
 use serde::Serialize;
 use tokio::{io::copy_bidirectional, net::TcpListener};
-use url::{Host, Url};
+use url::Url;
 
 use crate::{
     BoxError,
@@ -34,34 +31,26 @@ const MAX_HTML_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const INJECTED_SCRIPT: &[u8] = b"\n<script type=\"module\" src=\"/_komtar/client.js\"></script>\n";
 
 type AppBody = UnsyncBoxBody<Bytes, BoxError>;
-type HttpClient = Client<HttpConnector, AppBody>;
-
-#[derive(Clone)]
-pub(crate) enum ServerMode {
-    Proxy { upstream: Url },
-    Serve,
-}
+type HttpClient = Client<HttpsConnector<HttpConnector>, AppBody>;
 
 #[derive(Clone)]
 pub(crate) struct ServerState {
-    mode: ServerMode,
+    upstream: Url,
     queue: CommentQueue,
-    allowed_origins: Arc<HashSet<String>>,
     client: HttpClient,
 }
 
 impl ServerState {
-    pub(crate) fn new(
-        mode: ServerMode,
-        queue: CommentQueue,
-        allowed_origins: HashSet<String>,
-    ) -> Self {
-        let connector = HttpConnector::new();
+    pub(crate) fn new(upstream: Url, queue: CommentQueue) -> Self {
+        let connector = HttpsConnectorBuilder::new()
+            .with_webpki_roots()
+            .https_or_http()
+            .enable_http1()
+            .build();
         let client = Client::builder(TokioExecutor::new()).build(connector);
         Self {
-            mode,
+            upstream,
             queue,
-            allowed_origins: Arc::new(allowed_origins),
             client,
         }
     }
@@ -101,13 +90,7 @@ async fn handle(
     let result = if path.starts_with(RESERVED_PREFIX) {
         handle_reserved(request, &state).await
     } else {
-        match &state.mode {
-            ServerMode::Proxy { upstream } => proxy_request(request, &state, upstream).await,
-            ServerMode::Serve => Ok(text_response(
-                StatusCode::NOT_FOUND,
-                "komtar serve only exposes /_komtar/ resources\n",
-            )),
-        }
+        proxy_request(request, &state, &state.upstream).await
     };
 
     Ok(result.unwrap_or_else(|error| {
@@ -120,37 +103,18 @@ async fn handle_reserved(
     request: Request<Incoming>,
     state: &ServerState,
 ) -> Result<Response<AppBody>, RequestError> {
-    let cors_origin = allowed_request_origin(&request, &state.allowed_origins)?;
-    if request.method() == Method::OPTIONS {
-        let mut response = empty_response(StatusCode::NO_CONTENT);
-        add_cors_headers(&mut response, cors_origin.as_deref());
-        response.headers_mut().insert(
-            ACCESS_CONTROL_ALLOW_METHODS,
-            header::HeaderValue::from_static("GET, POST, OPTIONS"),
-        );
-        response.headers_mut().insert(
-            ACCESS_CONTROL_ALLOW_HEADERS,
-            header::HeaderValue::from_static("Content-Type"),
-        );
-        response.headers_mut().insert(
-            ACCESS_CONTROL_MAX_AGE,
-            header::HeaderValue::from_static("600"),
-        );
-        return Ok(response);
-    }
-
     let path = request.uri().path().to_owned();
     let result = match path.as_str() {
         CLIENT_PATH => {
             if request.method() != Method::GET {
-                Err(RequestError::method_not_allowed("GET, OPTIONS"))
+                Err(RequestError::method_not_allowed("GET"))
             } else {
                 Ok(javascript_response(crate::CLIENT_JS))
             }
         }
         STATUS_PATH => {
             if request.method() != Method::GET {
-                Err(RequestError::method_not_allowed("GET, OPTIONS"))
+                Err(RequestError::method_not_allowed("GET"))
             } else {
                 Ok(json_response(
                     StatusCode::OK,
@@ -162,7 +126,7 @@ async fn handle_reserved(
         }
         COMMENTS_PATH => {
             if request.method() != Method::POST {
-                Err(RequestError::method_not_allowed("POST, OPTIONS"))
+                Err(RequestError::method_not_allowed("POST"))
             } else {
                 read_draft(request)
                     .await
@@ -184,9 +148,7 @@ async fn handle_reserved(
             },
         )),
     };
-    let mut response = result.unwrap_or_else(request_error_response);
-    add_cors_headers(&mut response, cors_origin.as_deref());
-    Ok(response)
+    Ok(result.unwrap_or_else(request_error_response))
 }
 
 async fn read_draft(request: Request<Incoming>) -> Result<CommentDraft, RequestError> {
@@ -418,72 +380,6 @@ fn inject_client(html: &[u8]) -> Bytes {
     Bytes::from(output)
 }
 
-fn allowed_request_origin(
-    request: &Request<Incoming>,
-    allowed_origins: &HashSet<String>,
-) -> Result<Option<String>, RequestError> {
-    let Some(raw_origin) = request.headers().get(ORIGIN) else {
-        return Ok(None);
-    };
-    let origin = raw_origin
-        .to_str()
-        .map_err(|_| RequestError::new(StatusCode::FORBIDDEN, "request origin is not allowed"))?;
-    let parsed = Url::parse(origin)
-        .map_err(|_| RequestError::new(StatusCode::FORBIDDEN, "request origin is not allowed"))?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(RequestError::new(
-            StatusCode::FORBIDDEN,
-            "request origin is not allowed",
-        ));
-    }
-    let normalized = parsed.origin().ascii_serialization();
-    let same_host = request
-        .headers()
-        .get(HOST)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|host| origin_matches_host(&parsed, host));
-    if same_host || origin_is_loopback(&parsed) || allowed_origins.contains(&normalized) {
-        return Ok(Some(normalized));
-    }
-    Err(RequestError::new(
-        StatusCode::FORBIDDEN,
-        "request origin is not allowed",
-    ))
-}
-
-fn origin_matches_host(origin: &Url, host: &str) -> bool {
-    let Ok(host_url) = Url::parse(&format!("http://{host}")) else {
-        return false;
-    };
-    origin.host_str() == host_url.host_str()
-        && origin.port_or_known_default() == host_url.port_or_known_default()
-}
-
-fn origin_is_loopback(origin: &Url) -> bool {
-    match origin.host() {
-        Some(Host::Domain("localhost")) => true,
-        Some(Host::Ipv4(address)) => IpAddr::V4(address).is_loopback(),
-        Some(Host::Ipv6(address)) => IpAddr::V6(address).is_loopback(),
-        Some(Host::Domain(_)) => false,
-        None => false,
-    }
-}
-
-fn add_cors_headers(response: &mut Response<AppBody>, origin: Option<&str>) {
-    let Some(origin) = origin else {
-        return;
-    };
-    let Ok(value) = header::HeaderValue::from_str(origin) else {
-        return;
-    };
-    response
-        .headers_mut()
-        .insert(ACCESS_CONTROL_ALLOW_ORIGIN, value);
-    response
-        .headers_mut()
-        .insert(VARY, header::HeaderValue::from_static("Origin"));
-}
-
 #[derive(Serialize)]
 struct PendingResponse {
     pending: usize,
@@ -541,22 +437,6 @@ fn javascript_response(script: &'static str) -> Response<AppBody> {
     response
 }
 
-fn text_response(status: StatusCode, text: &'static str) -> Response<AppBody> {
-    let mut response = Response::new(full_body(Bytes::from_static(text.as_bytes())));
-    *response.status_mut() = status;
-    response.headers_mut().insert(
-        CONTENT_TYPE,
-        header::HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response
-}
-
-fn empty_response(status: StatusCode) -> Response<AppBody> {
-    let mut response = Response::new(full_body(Bytes::new()));
-    *response.status_mut() = status;
-    response
-}
-
 fn full_body(bytes: Bytes) -> AppBody {
     Full::new(bytes)
         .map_err(|never: Infallible| match never {})
@@ -577,7 +457,7 @@ fn map_incoming_response(response: Response<Incoming>) -> Response<AppBody> {
 mod tests {
     use hyper::{Request, header::HOST};
 
-    use super::{inject_client, origin_is_loopback, origin_matches_host, rewrite_redirect};
+    use super::{inject_client, rewrite_redirect};
 
     #[test]
     fn injects_before_a_case_insensitive_body_close() {
@@ -591,24 +471,6 @@ mod tests {
     fn appends_when_html_has_no_body_close() {
         let output = inject_client(b"<p>Hello</p>");
         assert!(String::from_utf8_lossy(&output).ends_with("</script>\n"));
-    }
-
-    #[test]
-    fn recognizes_local_origins_and_exact_hosts() {
-        assert!(origin_is_loopback(
-            &url::Url::parse("http://127.0.0.1:8000").expect("URL")
-        ));
-        assert!(origin_is_loopback(
-            &url::Url::parse("http://[::1]:8000").expect("URL")
-        ));
-        assert!(origin_matches_host(
-            &url::Url::parse("http://example.test:3939").expect("URL"),
-            "example.test:3939"
-        ));
-        assert!(!origin_matches_host(
-            &url::Url::parse("http://example.test:4000").expect("URL"),
-            "example.test:3939"
-        ));
     }
 
     #[test]

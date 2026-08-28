@@ -13,6 +13,7 @@ clap = { version = "4.6.6", features = ["derive"] }
 futures-util = "0.3.34"
 http-body-util = "0.1.5"
 hyper = { version = "1.11.1", features = ["server", "http1", "client"] }
+hyper-rustls = { version = "0.27.9", default-features = false, features = ["http1", "webpki-roots", "ring", "tls12"] }
 hyper-util = { version = "0.1.20", features = ["server", "http1", "client", "client-legacy", "tokio"] }
 jiff = "0.2.35"
 nix = { version = "0.31.3", features = ["fs"] }
@@ -31,6 +32,7 @@ tempfile = "3.27.0"
 unsafe_code = "forbid"
 
 [lints.clippy]
+fallible_impl_from = "warn"
 fn_params_excessive_bools = "warn"
 indexing_slicing = "warn"
 must_use_candidate = "warn"
