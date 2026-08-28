@@ -1,0 +1,13 @@
+{
+  "name": "komtar-browser-client",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "lint": "eslint assets/client.js eslint.config.js"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "eslint": "10.9.1",
+    "globals": "17.11.0"
+  }
+}

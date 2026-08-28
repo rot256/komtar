@@ -6,6 +6,9 @@ fmt:
 lint:
     cargo clippy --all-targets --all-features -- -D warnings
 
+lint-js:
+    npm run lint
+
 test:
     cargo test
 
@@ -15,4 +18,4 @@ e2e:
 build:
     cargo build --release
 
-ci: fmt lint test e2e build
+ci: fmt lint lint-js test e2e build

@@ -10,6 +10,8 @@ Run the checks below before handing off changes:
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
+npm ci
+npm run lint
 uv run pytest
 cargo build --release
 ```
