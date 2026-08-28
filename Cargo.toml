@@ -1,11 +1,15 @@
 [package]
 name = "komtar"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "Development reverse proxy for queuing browser feedback through a FIFO"
 license = "MIT"
 repository = "https://github.com/rot256/komtar"
 readme = "README.md"
+keywords = ["browser", "cli", "development", "feedback", "proxy"]
+categories = ["command-line-utilities", "development-tools", "web-programming::http-server"]
+publish = ["crates-io"]
+include = ["/assets/client.js", "/src", "/LICENSE", "/README.md"]
 
 [dependencies]
 bytes = "1.12.1"

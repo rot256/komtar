@@ -9,7 +9,7 @@ Stupid simple. Works with any framework. Single binary.
 Install with Cargo:
 
 ```sh
-cargo install --git https://github.com/rot256/komtar
+cargo install komtar
 ```
 
 Or download a prebuilt macOS ARM64 binary, or a statically linked Linux AMD64 or

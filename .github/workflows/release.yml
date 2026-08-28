@@ -103,6 +103,9 @@ jobs:
       - name: Run Rust tests
         run: cargo test --locked
 
+      - name: Check crates.io package
+        run: cargo publish --locked --dry-run
+
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
@@ -199,12 +202,44 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  publish:
+    name: Publish to crates.io
+    if: needs.metadata.outputs.publish == 'true'
+    needs:
+      - metadata
+      - build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      CRATES_IO_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      # A token is required for the first release. Once trusted publishing is
+      # configured on crates.io, remove the secret to use short-lived OIDC tokens.
+      - name: Authenticate with crates.io
+        if: env.CRATES_IO_TOKEN == ''
+        id: auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: Publish crate
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ env.CRATES_IO_TOKEN || steps.auth.outputs.token }}
+        run: cargo publish --locked
+
   release:
     name: Publish GitHub release
     if: needs.metadata.outputs.publish == 'true'
     needs:
       - metadata
       - build
+      - publish
     runs-on: ubuntu-24.04
     permissions:
       contents: write
