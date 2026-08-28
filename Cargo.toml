@@ -1,10 +1,10 @@
 [package]
-name = "web-fifo"
+name = "komtar"
 version = "0.1.0"
 edition = "2024"
 description = "Development reverse proxy for queuing browser feedback through a FIFO"
 license = "MIT"
-repository = "https://github.com/rot256/web-fifo"
+repository = "https://github.com/rot256/komtar"
 readme = "README.md"
 
 [dependencies]

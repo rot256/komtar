@@ -545,6 +545,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "komtar"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "clap",
+ "futures-util",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "jiff",
+ "nix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1115,28 +1137,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ef64dbcc55df09c7e5a46182d181c2cfa3e925f3da937ea764728b4bbb9dcbf"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "web-fifo"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "clap",
- "futures-util",
- "http-body-util",
- "hyper",
- "hyper-util",
- "jiff",
- "nix",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "url",
- "uuid",
 ]
 
 [[package]]

@@ -26,13 +26,12 @@ use crate::{
     model::{CommentDraft, CommentRecord, MAX_REQUEST_BYTES, RequestError},
 };
 
-pub(crate) const RESERVED_PREFIX: &str = "/_web-fifo/";
-const CLIENT_PATH: &str = "/_web-fifo/client.js";
-const STATUS_PATH: &str = "/_web-fifo/api/status";
-const COMMENTS_PATH: &str = "/_web-fifo/api/comments";
+pub(crate) const RESERVED_PREFIX: &str = "/_komtar/";
+const CLIENT_PATH: &str = "/_komtar/client.js";
+const STATUS_PATH: &str = "/_komtar/api/status";
+const COMMENTS_PATH: &str = "/_komtar/api/comments";
 const MAX_HTML_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
-const INJECTED_SCRIPT: &[u8] =
-    b"\n<script type=\"module\" src=\"/_web-fifo/client.js\"></script>\n";
+const INJECTED_SCRIPT: &[u8] = b"\n<script type=\"module\" src=\"/_komtar/client.js\"></script>\n";
 
 type AppBody = UnsyncBoxBody<Bytes, BoxError>;
 type HttpClient = Client<HttpConnector, AppBody>;
@@ -106,7 +105,7 @@ async fn handle(
             ServerMode::Proxy { upstream } => proxy_request(request, &state, upstream).await,
             ServerMode::Serve => Ok(text_response(
                 StatusCode::NOT_FOUND,
-                "web-fifo serve only exposes /_web-fifo/ resources\n",
+                "komtar serve only exposes /_komtar/ resources\n",
             )),
         }
     };
@@ -181,7 +180,7 @@ async fn handle_reserved(
         _ => Ok(json_response(
             StatusCode::NOT_FOUND,
             &ErrorResponse {
-                error: "reserved web-fifo resource not found",
+                error: "reserved komtar resource not found",
             },
         )),
     };

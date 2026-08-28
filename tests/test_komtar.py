@@ -37,13 +37,13 @@ def wait_for_port(process: subprocess.Popen[str], port: int) -> None:
     while time.monotonic() < deadline:
         if process.poll() is not None:
             stdout, _ = process.communicate()
-            pytest.fail(f"web-fifo exited with {process.returncode}:\n{stdout}")
+            pytest.fail(f"komtar exited with {process.returncode}:\n{stdout}")
         with socket.socket() as sock:
             sock.settimeout(0.1)
             if sock.connect_ex((HOST, port)) == 0:
                 return
         time.sleep(0.05)
-    pytest.fail(f"web-fifo did not listen on port {port}")
+    pytest.fail(f"komtar did not listen on port {port}")
 
 
 class FixtureHandler(BaseHTTPRequestHandler):
@@ -135,9 +135,9 @@ def upstream_server():
 
 
 @contextmanager
-def web_fifo(command: str, fifo: Path, upstream: str | None = None):
+def komtar(command: str, fifo: Path, upstream: str | None = None):
     port = available_port()
-    arguments = [str(TARGET_DIR / "debug/web-fifo"), command]
+    arguments = [str(TARGET_DIR / "debug/komtar"), command]
     if upstream is not None:
         arguments.append(upstream)
     arguments.extend(["--listen", f"{HOST}:{port}", "--fifo", str(fifo)])
@@ -183,16 +183,16 @@ def page(browser: Browser) -> Page:
 def test_proxy_injects_only_html_and_preserves_http_behavior() -> None:
     with tempfile.TemporaryDirectory() as temporary, upstream_server() as upstream:
         fifo = Path(temporary) / "comments.fifo"
-        with web_fifo("proxy", fifo, upstream) as proxy:
+        with komtar("proxy", fifo, upstream) as proxy:
             direct = urlopen(upstream).read()
             annotated = urlopen(proxy).read()
-            assert b'id="web-fifo"' not in direct
-            assert b'/_web-fifo/client.js' in annotated
-            assert b'/_web-fifo/client.js' in urlopen(proxy + "/without-body").read()
+            assert b'id="komtar"' not in direct
+            assert b'/_komtar/client.js' in annotated
+            assert b'/_komtar/client.js' in urlopen(proxy + "/without-body").read()
             assert urlopen(proxy + "/asset.bin").read() == bytes(range(256))
             large = urlopen(proxy + "/large").read()
             assert len(large) == 2 * 1024 * 1024 + 1
-            assert b'/_web-fifo/client.js' not in large
+            assert b'/_komtar/client.js' not in large
 
             payload = b"method body survives"
             echoed = urlopen(Request(proxy + "/echo", data=payload, method="POST")).read()
@@ -211,7 +211,7 @@ def test_proxy_injects_only_html_and_preserves_http_behavior() -> None:
 def test_proxy_forwards_websocket_upgrades(page: Page) -> None:
     with tempfile.TemporaryDirectory() as temporary, upstream_server() as upstream:
         fifo = Path(temporary) / "comments.fifo"
-        with web_fifo("proxy", fifo, upstream) as proxy:
+        with komtar("proxy", fifo, upstream) as proxy:
             echoed = page.evaluate(
                 """(base) => new Promise((resolve, reject) => {
                   const socket = new WebSocket(base.replace('http:', 'ws:') + '/socket');
@@ -234,10 +234,10 @@ def test_browser_queues_selection_context_coordinates_and_multiple_edits(
 ) -> None:
     with tempfile.TemporaryDirectory() as temporary, upstream_server() as upstream:
         fifo = Path(temporary) / "comments.fifo"
-        with web_fifo("proxy", fifo, upstream) as proxy:
+        with komtar("proxy", fifo, upstream) as proxy:
             page.goto(proxy, wait_until="networkidle")
-            expect(page.locator("#web-fifo")).to_be_attached()
-            expect(page.locator("#web-fifo #badge")).to_have_text("0 queued")
+            expect(page.locator("#komtar")).to_be_attached()
+            expect(page.locator("#komtar #badge")).to_have_text("0 queued")
 
             selected_text = page.evaluate(
                 """() => {
@@ -260,19 +260,19 @@ def test_browser_queues_selection_context_coordinates_and_multiple_edits(
                   return selected;
                 }"""
             )
-            dialog = page.locator("#web-fifo-dialog")
+            dialog = page.locator("#komtar-dialog")
             expect(dialog).to_be_visible()
             expect(page.get_by_text("Suggest Edit:", exact=True)).to_be_visible()
-            expect(page.locator("#web-fifo #selection-text")).to_have_text(selected_text)
-            page.locator("#web-fifo textarea").fill("Rewrite this sentence.")
-            page.locator("#web-fifo textarea").press("Enter")
+            expect(page.locator("#komtar #selection-text")).to_have_text(selected_text)
+            page.locator("#komtar textarea").fill("Rewrite this sentence.")
+            page.locator("#komtar textarea").press("Enter")
             expect(dialog).to_be_hidden()
-            expect(page.locator("#web-fifo #badge")).to_have_text("1 queued")
+            expect(page.locator("#komtar #badge")).to_have_text("1 queued")
 
             page.locator("#action").click(button="right", position={"x": 5, "y": 4})
-            page.locator("#web-fifo textarea").fill("Use a clearer label.")
+            page.locator("#komtar textarea").fill("Use a clearer label.")
             page.get_by_role("button", name="Queue comment").click()
-            expect(page.locator("#web-fifo #badge")).to_have_text("2 queued")
+            expect(page.locator("#komtar #badge")).to_have_text("2 queued")
 
             with ThreadPoolExecutor(max_workers=1) as pool:
                 delivered = pool.submit(fifo.read_text, encoding="utf-8")
@@ -287,34 +287,34 @@ def test_browser_queues_selection_context_coordinates_and_multiple_edits(
             assert records[0]["target"]["selector"] == "#intro"
             assert records[0]["pointer"]["target"]["x"] == pytest.approx(18, abs=1)
             assert records[0]["pointer"]["target"]["y"] == pytest.approx(12, abs=1)
-            expect(page.locator("#web-fifo #badge")).to_have_text("0 queued")
+            expect(page.locator("#komtar #badge")).to_have_text("0 queued")
 
 
 def test_clicking_outside_closes_without_queueing(page: Page) -> None:
     with tempfile.TemporaryDirectory() as temporary, upstream_server() as upstream:
         fifo = Path(temporary) / "comments.fifo"
-        with web_fifo("proxy", fifo, upstream) as proxy:
+        with komtar("proxy", fifo, upstream) as proxy:
             page.goto(proxy, wait_until="networkidle")
             page.locator("#intro").click(button="right")
-            dialog = page.locator("#web-fifo-dialog")
+            dialog = page.locator("#komtar-dialog")
             expect(dialog).to_be_visible()
             page.mouse.click(1, 1)
             expect(dialog).to_be_hidden()
-            expect(page.locator("#web-fifo #badge")).to_have_text("0 queued")
+            expect(page.locator("#komtar #badge")).to_have_text("0 queued")
 
 
 def test_script_tag_mode_allows_loopback_and_rejects_other_origins(page: Page) -> None:
     with tempfile.TemporaryDirectory() as temporary, upstream_server() as upstream:
         fifo = Path(temporary) / "comments.fifo"
-        with web_fifo("serve", fifo) as service:
+        with komtar("serve", fifo) as service:
             FixtureHandler.fallback_script = (
-                f'<script type="module" src="{service}/_web-fifo/client.js"></script>'
+                f'<script type="module" src="{service}/_komtar/client.js"></script>'
             )
             page.goto(upstream + "/fallback", wait_until="networkidle")
-            expect(page.locator("#web-fifo")).to_be_attached()
+            expect(page.locator("#komtar")).to_be_attached()
 
             request = Request(
-                service + "/_web-fifo/client.js",
+                service + "/_komtar/client.js",
                 headers={"Origin": "https://not-allowed.example"},
             )
             with pytest.raises(HTTPError) as raised:

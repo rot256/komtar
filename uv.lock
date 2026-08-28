@@ -171,7 +171,7 @@ wheels = [
 ]
 
 [[package]]
-name = "web-fifo-tests"
+name = "komtar-tests"
 version = "0.1.0"
 source = { virtual = "." }
 

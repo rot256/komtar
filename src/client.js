@@ -1,7 +1,7 @@
 const BASE = new URL("./", import.meta.url);
 const COMMENTS_URL = new URL("api/comments", BASE);
 const STATUS_URL = new URL("api/status", BASE);
-const HOST_ID = "web-fifo";
+const HOST_ID = "komtar";
 const MAX_SELECTED_TEXT = 2000;
 const MAX_TEXT = 4000;
 const MAX_HTML = 8000;
@@ -263,7 +263,7 @@ function install() {
     <div id="highlight" aria-hidden="true"></div>
     <div id="badge" role="status" aria-live="polite">0 queued</div>
     <div id="toast" role="status" aria-live="polite" hidden></div>
-    <dialog id="web-fifo-dialog" aria-labelledby="dialog-label">
+    <dialog id="komtar-dialog" aria-labelledby="dialog-label">
       <form>
         <label id="dialog-label" for="comment">Suggest Edit:</label>
         <div id="selection-preview" hidden>

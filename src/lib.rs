@@ -18,17 +18,17 @@ pub(crate) const CLIENT_JS: &str = include_str!("client.js");
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "web-fifo",
+    name = "komtar",
     version,
     about = "Queue browser feedback as JSON records in a FIFO"
 )]
 pub struct Cli {
-    /// Address on which web-fifo accepts browser requests.
+    /// Address on which komtar accepts browser requests.
     #[arg(long, global = true, default_value = "127.0.0.1:3939")]
     listen: SocketAddr,
 
     /// FIFO to create and use for newline-delimited JSON delivery.
-    #[arg(long, global = true, default_value = ".web-fifo")]
+    #[arg(long, global = true, default_value = ".komtar")]
     fifo: PathBuf,
 
     /// Additional origin allowed to use script-tag mode. May be repeated.
@@ -73,16 +73,16 @@ pub async fn run(cli: Cli) -> Result<(), BoxError> {
     let base_url = format!("http://{listen}");
     match &mode {
         ServerMode::Proxy { upstream } => {
-            println!("web-fifo: proxying {upstream} at {base_url}");
+            println!("komtar: proxying {upstream} at {base_url}");
         }
         ServerMode::Serve => {
-            println!("web-fifo: serving the annotation client at {base_url}");
+            println!("komtar: serving the annotation client at {base_url}");
         }
     }
-    println!("web-fifo: FIFO {}", fifo.display());
-    println!("web-fifo: read comments with: cat {}", fifo.display());
+    println!("komtar: FIFO {}", fifo.display());
+    println!("komtar: read comments with: cat {}", fifo.display());
     println!(
-        "web-fifo: script-tag fallback: <script type=\"module\" src=\"{base_url}/_web-fifo/client.js\"></script>"
+        "komtar: script-tag fallback: <script type=\"module\" src=\"{base_url}/_komtar/client.js\"></script>"
     );
 
     server::serve(listener, ServerState::new(mode, queue, allowed_origins)).await
@@ -131,7 +131,7 @@ mod tests {
     #[test]
     fn parses_proxy_options_after_the_subcommand() {
         let cli = Cli::try_parse_from([
-            "web-fifo",
+            "komtar",
             "proxy",
             "http://127.0.0.1:8000",
             "--listen",
