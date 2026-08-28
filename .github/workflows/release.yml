@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - Cargo.toml
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -29,6 +30,7 @@ jobs:
         id: package
         env:
           BEFORE_SHA: ${{ github.event.before }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "komtar") | .version')"
           if [ -z "$version" ] || [ "$version" = "null" ]; then
@@ -36,8 +38,16 @@ jobs:
             exit 1
           fi
 
+          if [ "$EVENT_NAME" = "push" ]; then
+            base_ref="$BEFORE_SHA"
+          else
+            base_ref="$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)"
+          fi
+
           previous_version="$(
-            git show "$BEFORE_SHA:Cargo.toml" |
+            if [ -n "$base_ref" ]; then
+              git show "${base_ref}:Cargo.toml"
+            fi |
               awk '
                 /^\[package\]$/ { in_package = 1; next }
                 /^\[/ { in_package = 0 }
@@ -52,10 +62,10 @@ jobs:
           )"
 
           if [ "$version" = "$previous_version" ]; then
-            echo "Cargo.toml changed, but the package version remains $version"
+            echo "Package version remains $version; no release needed"
             echo "publish=false" >> "$GITHUB_OUTPUT"
           else
-            echo "Package version changed from $previous_version to $version"
+            echo "Package version changed from ${previous_version:-unreleased} to $version"
             echo "publish=true" >> "$GITHUB_OUTPUT"
           fi
           echo "tag=v$version" >> "$GITHUB_OUTPUT"
@@ -72,10 +82,58 @@ jobs:
             exit 1
           fi
 
+  test:
+    name: Test
+    if: needs.metadata.outputs.publish == 'true'
+    needs: metadata
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Run Rust tests
+        run: cargo test --locked
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install JavaScript lint dependencies
+        run: npm ci
+
+      - name: Lint JavaScript
+        run: npm run lint
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          enable-cache: true
+
+      - name: Install browser test dependencies
+        run: |
+          uv sync --locked
+          uv run playwright install --with-deps chromium
+
+      - name: Run browser tests
+        run: uv run --locked pytest
+
   build:
     name: Build ${{ matrix.name }}
     if: needs.metadata.outputs.publish == 'true'
-    needs: metadata
+    needs:
+      - metadata
+      - test
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
