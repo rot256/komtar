@@ -19,11 +19,30 @@ Linux ARM64 binary, from the
 
 ## Usage
 
-Start your project's development server, then proxy it through Komtar:
+Serve a static site with live reload:
+
+```sh
+komtar serve ./public
+open http://127.0.0.1:3939
+```
+
+Komtar serves files and directory `index.html` files, returning a normal 404
+when a path does not exist. When a served file changes, open pages reload. If
+the suggestion dialog is open, Komtar waits until the suggestion is submitted
+or dismissed so the draft is not lost. Dotfiles (including the configured
+FIFO) are not exposed by the static server.
+
+For a project that already has a development server, proxy it through Komtar:
+
+```sh
+komtar proxy http://127.0.0.1:5173
+open http://127.0.0.1:3939
+```
+
+The original shorthand remains supported:
 
 ```sh
 komtar http://127.0.0.1:5173
-open http://127.0.0.1:3939
 ```
 
 Ask your coding agent to wait for queued suggestions:
@@ -41,7 +60,7 @@ cat .komtar
 Keep Komtar on loopback and expose it only to your tailnet:
 
 ```sh
-komtar http://127.0.0.1:5173
+komtar serve ./public
 ```
 
 In another terminal:

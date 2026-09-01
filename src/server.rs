@@ -1,25 +1,41 @@
-use std::{convert::Infallible, error::Error};
+use std::{
+    borrow::Cow,
+    convert::Infallible,
+    error::Error,
+    path::{Component, Path, PathBuf},
+    time::Duration,
+};
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full, Limited, combinators::UnsyncBoxBody};
+use futures_util::stream;
+use http_body_util::{BodyExt, Full, Limited, StreamBody, combinators::UnsyncBoxBody};
 use hyper::{
     Method, Request, Response, StatusCode, Uri,
-    body::Incoming,
-    header::{self, ALLOW, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG, HOST, LOCATION},
+    body::{Frame, Incoming},
+    header::{
+        self, ALLOW, CACHE_CONTROL, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, ETAG, HOST, LOCATION,
+    },
     service::service_fn,
 };
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
+use hyper_staticfile::{ResolveResult, Resolver, ResponseBuilder};
 use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::{TokioExecutor, TokioIo},
 };
 use serde::Serialize;
-use tokio::{io::copy_bidirectional, net::TcpListener};
+use tokio::{
+    io::copy_bidirectional,
+    net::TcpListener,
+    sync::watch,
+    time::{Instant, interval_at},
+};
 use url::Url;
 
 use crate::{
     BoxError,
     fifo::CommentQueue,
+    live::ReloadState,
     model::{CommentDraft, CommentRecord, MAX_REQUEST_BYTES, RequestError},
 };
 
@@ -27,21 +43,42 @@ pub(crate) const RESERVED_PREFIX: &str = "/_komtar/";
 const CLIENT_PATH: &str = "/_komtar/client.js";
 const STATUS_PATH: &str = "/_komtar/api/status";
 const COMMENTS_PATH: &str = "/_komtar/api/comments";
+const RELOAD_PATH: &str = "/_komtar/api/reload";
 const MAX_HTML_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
-const INJECTED_SCRIPT: &[u8] = b"\n<script type=\"module\" src=\"/_komtar/client.js\"></script>\n";
+const EDIT_SCRIPT: &[u8] = b"\n<script type=\"module\" src=\"/_komtar/client.js\"></script>\n";
+const SSE_HEARTBEAT: Duration = Duration::from_secs(15);
 
 type AppBody = UnsyncBoxBody<Bytes, BoxError>;
 type HttpClient = Client<HttpsConnector<HttpConnector>, AppBody>;
 
 #[derive(Clone)]
 pub(crate) struct ServerState {
-    upstream: Url,
     queue: CommentQueue,
-    client: HttpClient,
+    source: SourceState,
+}
+
+#[derive(Clone)]
+enum SourceState {
+    Proxy {
+        upstream: Url,
+        client: HttpClient,
+    },
+    Live {
+        root: PathBuf,
+        fifo: PathBuf,
+        resolver: Resolver,
+        reload: ReloadState,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum ClientMode<'a> {
+    Edit,
+    Live(&'a str),
 }
 
 impl ServerState {
-    pub(crate) fn new(upstream: Url, queue: CommentQueue) -> Self {
+    pub(crate) fn proxy(upstream: Url, queue: CommentQueue) -> Self {
         let connector = HttpsConnectorBuilder::new()
             .with_webpki_roots()
             .https_or_http()
@@ -49,9 +86,25 @@ impl ServerState {
             .build();
         let client = Client::builder(TokioExecutor::new()).build(connector);
         Self {
-            upstream,
             queue,
-            client,
+            source: SourceState::Proxy { upstream, client },
+        }
+    }
+
+    pub(crate) fn live(
+        root: PathBuf,
+        fifo: PathBuf,
+        queue: CommentQueue,
+        reload: ReloadState,
+    ) -> Self {
+        Self {
+            queue,
+            source: SourceState::Live {
+                resolver: Resolver::new(root.clone()),
+                root,
+                fifo,
+                reload,
+            },
         }
     }
 }
@@ -90,7 +143,20 @@ async fn handle(
     let result = if path.starts_with(RESERVED_PREFIX) {
         handle_reserved(request, &state).await
     } else {
-        proxy_request(request, &state, &state.upstream).await
+        match &state.source {
+            SourceState::Proxy { upstream, client } => {
+                proxy_request(request, client, upstream).await
+            }
+            SourceState::Live {
+                root,
+                fifo,
+                resolver,
+                reload,
+            } => {
+                let revision = reload.current();
+                static_request(request, root, fifo, resolver, &revision).await
+            }
+        }
     };
 
     Ok(result.unwrap_or_else(|error| {
@@ -141,6 +207,19 @@ async fn handle_reserved(
                     })
             }
         }
+        RELOAD_PATH => {
+            if request.method() != Method::GET {
+                Err(RequestError::method_not_allowed("GET"))
+            } else {
+                match &state.source {
+                    SourceState::Proxy { .. } => Err(RequestError::new(
+                        StatusCode::NOT_FOUND,
+                        "reserved komtar resource not found",
+                    )),
+                    SourceState::Live { reload, .. } => Ok(reload_response(reload.subscribe())),
+                }
+            }
+        }
         _ => Ok(json_response(
             StatusCode::NOT_FOUND,
             &ErrorResponse {
@@ -189,7 +268,7 @@ async fn read_draft(request: Request<Incoming>) -> Result<CommentDraft, RequestE
 
 async fn proxy_request(
     mut request: Request<Incoming>,
-    state: &ServerState,
+    client: &HttpClient,
     upstream: &Url,
 ) -> Result<Response<AppBody>, RequestError> {
     let downstream_upgrade = if request.headers().contains_key(header::UPGRADE) {
@@ -199,6 +278,7 @@ async fn proxy_request(
     };
     let original_host = request.headers().get(HOST).cloned();
     let (mut parts, body) = request.into_parts();
+    let request_method = parts.method.clone();
     parts.uri = upstream_uri(upstream, &parts.uri)?;
     parts.headers.insert(
         HOST,
@@ -220,7 +300,7 @@ async fn proxy_request(
     );
 
     let outgoing = Request::from_parts(parts, incoming_body(body));
-    let mut response = state.client.request(outgoing).await.map_err(|error| {
+    let mut response = client.request(outgoing).await.map_err(|error| {
         tracing::warn!(%error, "upstream request failed");
         RequestError::new(StatusCode::BAD_GATEWAY, "upstream request failed")
     })?;
@@ -247,7 +327,215 @@ async fn proxy_request(
         return Ok(map_incoming_response(response));
     }
 
-    maybe_inject_client(response).await
+    maybe_inject_client(
+        map_incoming_response(response),
+        &request_method,
+        ClientMode::Edit,
+    )
+    .await
+}
+
+async fn static_request(
+    request: Request<Incoming>,
+    root: &Path,
+    fifo: &Path,
+    resolver: &Resolver,
+    revision: &str,
+) -> Result<Response<AppBody>, RequestError> {
+    let request_method = request.method().clone();
+    if !matches!(request_method, Method::GET | Method::HEAD) {
+        return Err(RequestError::method_not_allowed("GET, HEAD"));
+    }
+    match static_path_access(request.uri().path(), root, fifo).await? {
+        StaticPathAccess::Serve => {}
+        StaticPathAccess::Reject(status) => return Ok(empty_response(status)),
+    }
+    let resolved = resolver.resolve_request(&request).await.map_err(|error| {
+        tracing::warn!(%error, "could not resolve static file");
+        RequestError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not read served directory",
+        )
+    })?;
+    let resolved = match resolved {
+        ResolveResult::MethodNotMatched => {
+            return Err(RequestError::method_not_allowed("GET, HEAD"));
+        }
+        ResolveResult::NotFound => ResolveResult::NotFound,
+        ResolveResult::PermissionDenied => ResolveResult::PermissionDenied,
+        ResolveResult::IsDirectory { redirect_to } => ResolveResult::IsDirectory { redirect_to },
+        ResolveResult::Found(file) => match tokio::fs::canonicalize(root.join(&file.path)).await {
+            Ok(path) if path.starts_with(root) => ResolveResult::Found(file),
+            Ok(path) => {
+                tracing::warn!(path = %path.display(), "refused to serve a symlink outside the root");
+                ResolveResult::NotFound
+            }
+            Err(error) if is_missing_path_error(&error) => ResolveResult::NotFound,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                ResolveResult::PermissionDenied
+            }
+            Err(error) => {
+                tracing::warn!(%error, "could not verify resolved static file");
+                return Err(RequestError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "could not read served directory",
+                ));
+            }
+        },
+    };
+    let resolved_content_type = match &resolved {
+        ResolveResult::Found(file) => file.content_type.clone(),
+        ResolveResult::MethodNotMatched
+        | ResolveResult::NotFound
+        | ResolveResult::PermissionDenied
+        | ResolveResult::IsDirectory { .. } => None,
+    };
+
+    let response = ResponseBuilder::new()
+        .request(&request)
+        .cache_headers(None)
+        .build(resolved)
+        .map_err(|error| {
+            tracing::warn!(%error, "could not build static file response");
+            RequestError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not build static file response",
+            )
+        })?;
+    let mut response = map_static_response(response);
+    if let Some(content_type) = resolved_content_type
+        && let Ok(value) = header::HeaderValue::from_str(&content_type)
+    {
+        response.headers_mut().entry(CONTENT_TYPE).or_insert(value);
+    }
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
+    maybe_inject_client(response, &request_method, ClientMode::Live(revision)).await
+}
+
+enum StaticPathAccess {
+    Serve,
+    Reject(StatusCode),
+}
+
+struct StaticRequestedPath {
+    path: PathBuf,
+    is_directory: bool,
+}
+
+impl StaticRequestedPath {
+    fn resolve(request_path: &str) -> Self {
+        let decoded = percent_encoding::percent_decode_str(request_path).decode_utf8_lossy();
+        let mut path = PathBuf::new();
+        for component in Path::new(decoded.as_ref()).components() {
+            match component {
+                Component::Normal(value) => {
+                    if Path::new(value)
+                        .components()
+                        .all(|nested| matches!(nested, Component::Normal(_)))
+                    {
+                        path.push(value);
+                    }
+                }
+                Component::ParentDir => {
+                    path.pop();
+                }
+                Component::Prefix(_) | Component::RootDir | Component::CurDir => {}
+            }
+        }
+        Self {
+            path,
+            is_directory: request_path.as_bytes().last() == Some(&b'/'),
+        }
+    }
+}
+
+async fn static_path_access(
+    request_path: &str,
+    root: &Path,
+    fifo: &Path,
+) -> Result<StaticPathAccess, RequestError> {
+    let requested = StaticRequestedPath::resolve(request_path);
+    if has_hidden_component(&requested.path) {
+        return Ok(StaticPathAccess::Reject(StatusCode::NOT_FOUND));
+    }
+    let path = match tokio::fs::canonicalize(root.join(&requested.path)).await {
+        Ok(path) => path,
+        Err(error) => return static_path_error(error, "could not verify requested static path"),
+    };
+    if !path.starts_with(root) || path == fifo {
+        return Ok(StaticPathAccess::Reject(StatusCode::NOT_FOUND));
+    }
+
+    let metadata = match tokio::fs::metadata(&path).await {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return static_path_error(error, "could not read requested static path metadata");
+        }
+    };
+    if metadata.is_file() && !requested.is_directory {
+        return Ok(StaticPathAccess::Serve);
+    }
+    if !metadata.is_dir() {
+        return Ok(StaticPathAccess::Reject(StatusCode::NOT_FOUND));
+    }
+    if !requested.is_directory {
+        return Ok(StaticPathAccess::Serve);
+    }
+
+    let index = match tokio::fs::canonicalize(path.join("index.html")).await {
+        Ok(index) => index,
+        Err(error) => return static_path_error(error, "could not verify directory index"),
+    };
+    if !index.starts_with(root) || index == fifo {
+        return Ok(StaticPathAccess::Reject(StatusCode::NOT_FOUND));
+    }
+    let metadata = match tokio::fs::metadata(index).await {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return static_path_error(error, "could not read directory index metadata");
+        }
+    };
+    if metadata.is_file() {
+        Ok(StaticPathAccess::Serve)
+    } else {
+        Ok(StaticPathAccess::Reject(StatusCode::NOT_FOUND))
+    }
+}
+
+fn has_hidden_component(path: &Path) -> bool {
+    path.components()
+        .any(|component| component.as_os_str().to_string_lossy().starts_with('.'))
+}
+
+fn static_path_error(
+    error: std::io::Error,
+    context: &'static str,
+) -> Result<StaticPathAccess, RequestError> {
+    if error.kind() == std::io::ErrorKind::PermissionDenied {
+        return Ok(StaticPathAccess::Reject(StatusCode::FORBIDDEN));
+    }
+    if is_missing_path_error(&error) {
+        return Ok(StaticPathAccess::Reject(StatusCode::NOT_FOUND));
+    }
+    tracing::warn!(%error, %context, "static path access failed");
+    Err(RequestError::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "could not read served directory",
+    ))
+}
+
+fn is_missing_path_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::NotADirectory
+            | std::io::ErrorKind::InvalidInput
+    ) || matches!(
+        error.raw_os_error(),
+        Some(nix::libc::ELOOP) | Some(nix::libc::ENAMETOOLONG)
+    )
 }
 
 fn upstream_uri(upstream: &Url, incoming: &Uri) -> Result<Uri, RequestError> {
@@ -307,7 +595,9 @@ fn rewrite_redirect(headers: &mut header::HeaderMap, upstream: &Url) {
 }
 
 async fn maybe_inject_client(
-    response: Response<Incoming>,
+    response: Response<AppBody>,
+    request_method: &Method,
+    mode: ClientMode<'_>,
 ) -> Result<Response<AppBody>, RequestError> {
     let is_html = response
         .headers()
@@ -316,11 +606,17 @@ async fn maybe_inject_client(
         .and_then(|value| value.split(';').next())
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/html"));
     let is_encoded = response.headers().contains_key(header::CONTENT_ENCODING);
-    if !response.status().is_success() || !is_html || is_encoded {
+    let status_allows_injection =
+        response.status().is_success() && response.status() != StatusCode::PARTIAL_CONTENT;
+    if !matches!(*request_method, Method::GET | Method::HEAD)
+        || !status_allows_injection
+        || !is_html
+        || is_encoded
+    {
         if is_html && is_encoded {
-            tracing::warn!("upstream ignored Accept-Encoding: identity; HTML was not annotated");
+            tracing::warn!("encoded HTML was not annotated");
         }
-        return Ok(map_incoming_response(response));
+        return Ok(response);
     }
     if response
         .headers()
@@ -333,13 +629,30 @@ async fn maybe_inject_client(
             limit = MAX_HTML_RESPONSE_BYTES,
             "HTML response is too large to annotate"
         );
-        return Ok(map_incoming_response(response));
+        return Ok(response);
+    }
+
+    if request_method == Method::HEAD {
+        let mut response = response;
+        let script = client_script(mode);
+        let annotated_length = response
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok())
+            .and_then(|length| length.checked_add(script.len()));
+        annotate_headers(response.headers_mut(), annotated_length);
+        return Ok(response);
     }
 
     let (mut parts, body) = response.into_parts();
+    let body_error_status = match mode {
+        ClientMode::Edit => StatusCode::BAD_GATEWAY,
+        ClientMode::Live(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
     let bytes = body.collect().await.map_err(|error| {
-        tracing::warn!(%error, "could not read upstream HTML response");
-        RequestError::new(StatusCode::BAD_GATEWAY, "could not read upstream response")
+        tracing::warn!(%error, "could not read HTML response");
+        RequestError::new(body_error_status, "could not read HTML response")
     })?;
     let bytes = bytes.to_bytes();
     if bytes.len() > MAX_HTML_RESPONSE_BYTES {
@@ -351,33 +664,116 @@ async fn maybe_inject_client(
         return Ok(Response::from_parts(parts, full_body(bytes)));
     }
 
-    parts.headers.remove(CONTENT_LENGTH);
-    parts.headers.remove(ETAG);
-    parts.headers.remove(header::CONTENT_ENCODING);
-    parts.headers.remove(header::TRANSFER_ENCODING);
-    parts
-        .headers
-        .insert(CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
-    Ok(Response::from_parts(
-        parts,
-        full_body(inject_client(&bytes)),
-    ))
+    let bytes = inject_client(&bytes, mode);
+    annotate_headers(&mut parts.headers, Some(bytes.len()));
+    Ok(Response::from_parts(parts, full_body(bytes)))
 }
 
-fn inject_client(html: &[u8]) -> Bytes {
+fn annotate_headers(headers: &mut header::HeaderMap, content_length: Option<usize>) {
+    headers.remove(CONTENT_LENGTH);
+    if let Some(content_length) = content_length
+        && let Ok(value) = header::HeaderValue::from_str(&content_length.to_string())
+    {
+        headers.insert(CONTENT_LENGTH, value);
+    }
+    headers.remove(ETAG);
+    headers.remove(header::CONTENT_ENCODING);
+    headers.remove(header::TRANSFER_ENCODING);
+    headers.insert(CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
+}
+
+fn client_script(mode: ClientMode<'_>) -> Cow<'_, [u8]> {
+    match mode {
+        ClientMode::Edit => Cow::Borrowed(EDIT_SCRIPT),
+        ClientMode::Live(revision) => Cow::Owned(
+            format!(
+                "\n<script type=\"module\" src=\"/_komtar/client.js?live={revision}\"></script>\n"
+            )
+            .into_bytes(),
+        ),
+    }
+}
+
+fn inject_client(html: &[u8], mode: ClientMode<'_>) -> Bytes {
+    inject_client_script(html, client_script(mode).as_ref())
+}
+
+fn inject_client_script(html: &[u8], script: &[u8]) -> Bytes {
     let position = html
         .windows(b"</body>".len())
         .rposition(|window| window.eq_ignore_ascii_case(b"</body>"));
-    let mut output = Vec::with_capacity(html.len() + INJECTED_SCRIPT.len());
+    let mut output = Vec::with_capacity(html.len() + script.len());
     if let Some(position) = position {
         output.extend_from_slice(html.get(..position).unwrap_or_default());
-        output.extend_from_slice(INJECTED_SCRIPT);
+        output.extend_from_slice(script);
         output.extend_from_slice(html.get(position..).unwrap_or_default());
     } else {
         output.extend_from_slice(html);
-        output.extend_from_slice(INJECTED_SCRIPT);
+        output.extend_from_slice(script);
     }
     Bytes::from(output)
+}
+
+#[derive(Clone, Copy)]
+enum ReloadStreamPhase {
+    Initial,
+    Listening,
+}
+
+fn reload_response(receiver: watch::Receiver<String>) -> Response<AppBody> {
+    let mut heartbeat = interval_at(Instant::now() + SSE_HEARTBEAT, SSE_HEARTBEAT);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let events = stream::unfold(
+        (receiver, heartbeat, ReloadStreamPhase::Initial),
+        |(mut receiver, mut heartbeat, phase)| async move {
+            match phase {
+                ReloadStreamPhase::Initial => {
+                    let revision = receiver.borrow_and_update().clone();
+                    Some((
+                        Ok::<_, Infallible>(reload_frame(&revision)),
+                        (receiver, heartbeat, ReloadStreamPhase::Listening),
+                    ))
+                }
+                ReloadStreamPhase::Listening => {
+                    tokio::select! {
+                        changed = receiver.changed() => {
+                            if changed.is_err() {
+                                return None;
+                            }
+                            let revision = receiver.borrow_and_update().clone();
+                            Some((
+                                Ok(reload_frame(&revision)),
+                                (receiver, heartbeat, ReloadStreamPhase::Listening),
+                            ))
+                        }
+                        _ = heartbeat.tick() => Some((
+                            Ok(Frame::data(Bytes::from_static(b": keep-alive\n\n"))),
+                            (receiver, heartbeat, ReloadStreamPhase::Listening),
+                        )),
+                    }
+                }
+            }
+        },
+    );
+    let body = StreamBody::new(events)
+        .map_err(|never: Infallible| match never {})
+        .boxed_unsync();
+    let mut response = Response::new(body);
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        header::HeaderValue::from_static("text/event-stream; charset=utf-8"),
+    );
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
+    response
+        .headers_mut()
+        .insert(CONNECTION, header::HeaderValue::from_static("keep-alive"));
+    response
+}
+
+fn reload_frame(revision: &str) -> Frame<Bytes> {
+    Frame::data(Bytes::from(format!("data: {revision}\n\n")))
 }
 
 #[derive(Serialize)]
@@ -437,6 +833,15 @@ fn javascript_response(script: &'static str) -> Response<AppBody> {
     response
 }
 
+fn empty_response(status: StatusCode) -> Response<AppBody> {
+    let mut response = Response::new(full_body(Bytes::new()));
+    *response.status_mut() = status;
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
+    response
+}
+
 fn full_body(bytes: Bytes) -> AppBody {
     Full::new(bytes)
         .map_err(|never: Infallible| match never {})
@@ -453,15 +858,27 @@ fn map_incoming_response(response: Response<Incoming>) -> Response<AppBody> {
     Response::from_parts(parts, incoming_body(body))
 }
 
+fn map_static_response(response: Response<hyper_staticfile::Body>) -> Response<AppBody> {
+    let (parts, body) = response.into_parts();
+    let body = body
+        .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)
+        .boxed_unsync();
+    Response::from_parts(parts, body)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use hyper::{Request, header::HOST};
 
-    use super::{inject_client, rewrite_redirect};
+    use super::{
+        ClientMode, StaticRequestedPath, has_hidden_component, inject_client, rewrite_redirect,
+    };
 
     #[test]
     fn injects_before_a_case_insensitive_body_close() {
-        let output = inject_client(b"<html><body>Hello</BODY></html>");
+        let output = inject_client(b"<html><body>Hello</BODY></html>", ClientMode::Edit);
         let output = String::from_utf8(output.to_vec()).expect("UTF-8 HTML");
         assert!(output.contains("Hello\n<script type=\"module\""));
         assert!(output.ends_with("</BODY></html>"));
@@ -469,8 +886,25 @@ mod tests {
 
     #[test]
     fn appends_when_html_has_no_body_close() {
-        let output = inject_client(b"<p>Hello</p>");
+        let output = inject_client(b"<p>Hello</p>", ClientMode::Edit);
         assert!(String::from_utf8_lossy(&output).ends_with("</script>\n"));
+    }
+
+    #[test]
+    fn marks_the_live_client_script() {
+        let output = inject_client(b"<body>Hello</body>", ClientMode::Live("revision"));
+        assert!(String::from_utf8_lossy(&output).contains("client.js?live=revision"));
+    }
+
+    #[test]
+    fn sanitizes_paths_without_leaving_the_static_root() {
+        let requested = StaticRequestedPath::resolve("/docs/../../index.html");
+        assert_eq!(requested.path, PathBuf::from("index.html"));
+        assert!(!requested.is_directory);
+
+        let encoded = StaticRequestedPath::resolve("/%2e%2e/%2eenv");
+        assert_eq!(encoded.path, PathBuf::from(".env"));
+        assert!(has_hidden_component(&encoded.path));
     }
 
     #[test]

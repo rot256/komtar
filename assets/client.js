@@ -1,6 +1,8 @@
 const BASE = new URL("./", import.meta.url);
 const COMMENTS_URL = new URL("api/comments", BASE);
 const STATUS_URL = new URL("api/status", BASE);
+const RELOAD_URL = new URL("api/reload", BASE);
+const LIVE_REVISION = new URL(import.meta.url).searchParams.get("live");
 const HOST_ID = "komtar";
 const MAX_SELECTED_TEXT = 2000;
 const MAX_TEXT = 4000;
@@ -129,6 +131,15 @@ const styles = `
     font-size: 11px;
     line-height: 1.4;
   }
+
+  #reload-notice {
+    margin-top: 7px;
+    color: #655f58;
+    font-size: 11px;
+    line-height: 1.4;
+  }
+
+  #reload-notice[hidden] { display: none; }
 
   .actions {
     display: flex;
@@ -272,6 +283,9 @@ function install() {
         </div>
         <textarea id="comment" name="comment" maxlength="10000" required></textarea>
         <div id="status" role="alert"></div>
+        <div id="reload-notice" role="status" hidden>
+          Files changed. Reloading when this edit closes.
+        </div>
         <div class="actions">
           <button id="cancel" type="button">Cancel</button>
           <button id="send" type="submit">Queue comment</button>
@@ -290,11 +304,12 @@ function install() {
   const selectionText = shadow.querySelector("#selection-text");
   const textarea = shadow.querySelector("textarea");
   const status = shadow.querySelector("#status");
+  const reloadNotice = shadow.querySelector("#reload-notice");
   const cancel = shadow.querySelector("#cancel");
   const send = shadow.querySelector("#send");
   if (
     !highlight || !badge || !toast || !dialog || !form || !selectionPreview ||
-    !selectionText || !textarea || !status || !cancel || !send
+    !selectionText || !textarea || !status || !reloadNotice || !cancel || !send
   ) {
     host.remove();
     return;
@@ -302,6 +317,8 @@ function install() {
 
   let captured = null;
   let toastTimer;
+  let pendingReload = false;
+  let reloadRevision = LIVE_REVISION;
 
   const setPending = (pending) => {
     badge.textContent = `${pending} queued`;
@@ -342,6 +359,7 @@ function install() {
     selectionText.textContent = "";
     status.textContent = "";
     textarea.value = "";
+    if (pendingReload) window.location.reload();
   };
 
   const placeDialog = (x, y) => {
@@ -353,12 +371,16 @@ function install() {
   };
 
   const openDialog = (target, event) => {
-    if (dialog.open) closeDialog();
+    if (dialog.open) {
+      textarea.focus();
+      return;
+    }
     captured = captureTarget(target, event);
     const selectedText = captured.context.target.selectedText;
     selectionPreview.hidden = selectedText === null;
     selectionText.textContent = selectedText ?? "";
     status.textContent = "";
+    reloadNotice.hidden = !pendingReload;
     textarea.value = "";
     dialog.showModal();
     placeDialog(event.clientX, event.clientY);
@@ -426,6 +448,7 @@ function install() {
     closeDialog();
   });
   dialog.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
     const rect = dialog.getBoundingClientRect();
     if (
       event.clientX < rect.left || event.clientX > rect.right ||
@@ -448,6 +471,21 @@ function install() {
   };
   refreshPending();
   setInterval(refreshPending, 750);
+
+  if (LIVE_REVISION !== null) {
+    const reloadEvents = new EventSource(RELOAD_URL);
+    reloadEvents.addEventListener("message", (event) => {
+      if (!event.data) return;
+      if (event.data === reloadRevision) return;
+      reloadRevision = event.data;
+      if (dialog.open) {
+        pendingReload = true;
+        reloadNotice.hidden = false;
+      } else {
+        window.location.reload();
+      }
+    });
+  }
 }
 
 if (document.readyState === "loading") {

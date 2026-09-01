@@ -1,4 +1,4 @@
-"""HTTP and browser integration tests for the standalone proxy."""
+"""HTTP and browser integration tests for Komtar's proxy and static server."""
 
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -79,6 +79,17 @@ class FixtureHandler(BaseHTTPRequestHandler):
         else:
             self.send_bytes(404, "text/plain", b"missing")
 
+    def do_HEAD(self) -> None:
+        if self.path == "/":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(FIXTURE_HTML)))
+            self.end_headers()
+        else:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
     def handle_websocket(self) -> None:
         key = self.headers["Sec-WebSocket-Key"]
         accept = base64.b64encode(
@@ -127,9 +138,9 @@ def upstream_server():
 
 
 @contextmanager
-def komtar(fifo: Path, upstream: str):
+def komtar(fifo: Path, *source: str):
     port = available_port()
-    arguments = [str(TARGET_DIR / "debug/komtar"), upstream]
+    arguments = [str(TARGET_DIR / "debug/komtar"), *source]
     arguments.extend(["--listen", f"{HOST}:{port}", "--fifo", str(fifo)])
     process = subprocess.Popen(
         arguments,
@@ -173,11 +184,14 @@ def page(browser: Browser) -> Page:
 def test_proxy_injects_only_html_and_preserves_http_behavior() -> None:
     with tempfile.TemporaryDirectory() as temporary, upstream_server() as upstream:
         fifo = Path(temporary) / "comments.fifo"
-        with komtar(fifo, upstream) as proxy:
+        with komtar(fifo, "proxy", upstream) as proxy:
             direct = urlopen(upstream).read()
-            annotated = urlopen(proxy).read()
+            annotated_response = urlopen(proxy)
+            annotated = annotated_response.read()
             assert b'id="komtar"' not in direct
             assert b'/_komtar/client.js' in annotated
+            annotated_head = urlopen(Request(proxy, method="HEAD"))
+            assert int(annotated_head.headers["Content-Length"]) == len(annotated)
             assert b'/_komtar/client.js' in urlopen(proxy + "/without-body").read()
             assert urlopen(proxy + "/asset.bin").read() == bytes(range(256))
             large = urlopen(proxy + "/large").read()
@@ -291,3 +305,110 @@ def test_clicking_outside_closes_without_queueing(page: Page) -> None:
             page.mouse.click(1, 1)
             expect(dialog).to_be_hidden()
             expect(page.locator("#komtar #badge")).to_have_text("0 queued")
+
+
+def test_serve_routes_static_files_and_injects_the_live_client() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        site = Path(temporary) / "site"
+        site.mkdir()
+        (site / "index.html").write_text("<body><h1>Home</h1></body>", encoding="utf-8")
+        (site / "plain.txt").write_text("plain file", encoding="utf-8")
+        docs = site / "docs"
+        docs.mkdir()
+        (docs / "index.html").write_text("<h1>Docs</h1>", encoding="utf-8")
+        (site / ".env").write_text("SECRET=not-for-http", encoding="utf-8")
+        (site / "empty-dir").mkdir()
+        outside = Path(temporary) / "outside.txt"
+        outside.write_text("outside", encoding="utf-8")
+        (site / "outside.txt").symlink_to(outside)
+        fifo = site / ".komtar"
+
+        with komtar(fifo, "serve", str(site)) as server:
+            response = urlopen(server)
+            body = response.read()
+            assert response.headers["Cache-Control"] == "no-store"
+            assert b'/_komtar/client.js?live=' in body
+            revision = body.split(b'client.js?live=', 1)[1].split(b'"', 1)[0]
+            with urlopen(server + "/_komtar/api/reload", timeout=2) as events:
+                assert events.readline() == b"data: " + revision + b"\n"
+            assert urlopen(server + "/plain.txt").read() == b"plain file"
+            assert b"Docs" in urlopen(server + "/docs").read()
+            head_html = urlopen(Request(server, method="HEAD"))
+            assert int(head_html.headers["Content-Length"]) == len(body)
+
+            head = urlopen(Request(server + "/plain.txt", method="HEAD"))
+            assert head.read() == b""
+            with pytest.raises(HTTPError) as missing:
+                urlopen(server + "/missing")
+            assert missing.value.code == 404
+            for hidden_path in (
+                "/.komtar",
+                "/.env",
+                "/outside.txt",
+                "/plain.txt/nested",
+                "/empty-dir/",
+                "/%2e%2e/%2e%2e/not-in-root.txt",
+            ):
+                with pytest.raises(HTTPError) as hidden:
+                    urlopen(server + hidden_path, timeout=2)
+                assert hidden.value.code == 404
+            with pytest.raises(HTTPError) as wrong_method:
+                urlopen(Request(server + "/plain.txt", data=b"no", method="POST"))
+            assert wrong_method.value.code == 405
+            assert wrong_method.value.headers["Allow"] == "GET, HEAD"
+
+
+def test_live_reload_waits_for_an_open_edit_and_keeps_it_queueable(page: Page) -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        site = Path(temporary) / "site"
+        site.mkdir()
+        index = site / "index.html"
+        index.write_text(
+            '<body><h1 id="title">Version one</h1></body>', encoding="utf-8"
+        )
+        fifo = site / ".komtar"
+
+        with komtar(fifo, "serve", str(site)) as server:
+            page.add_init_script(
+                """sessionStorage.setItem(
+                  'komtar-test-loads',
+                  String(Number(sessionStorage.getItem('komtar-test-loads') || '0') + 1),
+                );"""
+            )
+            page.goto(server, wait_until="domcontentloaded")
+            expect(page.locator("#title")).to_have_text("Version one")
+
+            page.locator("#title").click(button="right")
+            textarea = page.locator("#komtar textarea")
+            textarea.fill("Keep this draft while files change.")
+            index.write_text(
+                '<body><h1 id="title">Version two</h1></body>', encoding="utf-8"
+            )
+
+            expect(page.locator("#komtar #reload-notice")).to_be_visible()
+            expect(textarea).to_have_value("Keep this draft while files change.")
+            expect(page.locator("#title")).to_have_text("Version one")
+            assert page.evaluate("sessionStorage.getItem('komtar-test-loads')") == "1"
+            page.locator("body").click(button="right", position={"x": 2, "y": 2})
+            expect(textarea).to_have_value("Keep this draft while files change.")
+            assert page.evaluate("sessionStorage.getItem('komtar-test-loads')") == "1"
+
+            page.get_by_role("button", name="Queue comment").click()
+            expect(page.locator("#title")).to_have_text("Version two")
+            assert page.evaluate("sessionStorage.getItem('komtar-test-loads')") == "2"
+
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                delivered = pool.submit(fifo.read_text, encoding="utf-8")
+                record = json.loads(delivered.result(timeout=5))
+            assert record["comment"] == "Keep this draft while files change."
+
+            time.sleep(0.5)
+            assert page.evaluate("sessionStorage.getItem('komtar-test-loads')") == "2"
+            (site / ".ignored").write_text("hidden change", encoding="utf-8")
+            time.sleep(0.5)
+            assert page.evaluate("sessionStorage.getItem('komtar-test-loads')") == "2"
+            index.write_text(
+                '<body><h1 id="title">Version three</h1></body>', encoding="utf-8"
+            )
+            expect(page.locator("#title")).to_have_text("Version three")
+            assert page.evaluate("sessionStorage.getItem('komtar-test-loads')") == "3"

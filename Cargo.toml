@@ -2,7 +2,7 @@
 name = "komtar"
 version = "0.2.2"
 edition = "2024"
-description = "Development reverse proxy for queuing browser feedback through a FIFO"
+description = "Development static server and reverse proxy for queuing browser feedback"
 license = "MIT"
 repository = "https://github.com/rot256/komtar"
 readme = "README.md"
@@ -18,12 +18,15 @@ futures-util = "0.3.34"
 http-body-util = "0.1.5"
 hyper = { version = "1.11.1", features = ["server", "http1", "client"] }
 hyper-rustls = { version = "0.27.9", default-features = false, features = ["http1", "webpki-roots", "ring", "tls12"] }
+hyper-staticfile = "0.10.1"
 hyper-util = { version = "0.1.20", features = ["server", "http1", "client", "client-legacy", "tokio"] }
 jiff = "0.2.35"
 nix = { version = "0.31.3", features = ["fs"] }
+notify = "8.2.0"
+percent-encoding = "2.3.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "signal", "time", "net", "io-util", "sync"] }
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "signal", "time", "net", "io-util", "sync", "fs"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url = "2.5.8"
