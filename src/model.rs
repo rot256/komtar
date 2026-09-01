@@ -65,6 +65,47 @@ pub(crate) struct CommentRecord {
     pub(crate) pointer: PointerContext,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AgentMessage {
+    pub(crate) version: u8,
+    pub(crate) message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) anchor: Option<String>,
+}
+
+impl AgentMessage {
+    pub(crate) fn new(message: String, anchor: Option<String>) -> Result<Self, String> {
+        Self {
+            version: 1,
+            message,
+            anchor,
+        }
+        .validate()
+    }
+
+    pub(crate) fn validate(self) -> Result<Self, String> {
+        if self.version != 1 {
+            return Err("version must equal 1".to_owned());
+        }
+        require_agent_text(&self.message, "message", 10_000)?;
+        if let Some(anchor) = &self.anchor {
+            require_agent_text(anchor, "anchor", 2_048)?;
+        }
+        Ok(self)
+    }
+}
+
+fn require_agent_text(value: &str, label: &str, maximum: usize) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(format!("{label} must not be blank"));
+    }
+    if value.chars().count() > maximum {
+        return Err(format!("{label} must be at most {maximum} characters"));
+    }
+    Ok(())
+}
+
 impl From<CommentDraft> for CommentRecord {
     fn from(draft: CommentDraft) -> Self {
         let CommentDraft {
@@ -205,7 +246,9 @@ fn validate_size(size: &Size, label: &str) -> Result<(), RequestError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CommentDraft, PageContext, Point, PointerContext, Size, TargetContext};
+    use super::{
+        AgentMessage, CommentDraft, PageContext, Point, PointerContext, Size, TargetContext,
+    };
 
     fn draft(comment: &str) -> CommentDraft {
         CommentDraft {
@@ -260,5 +303,26 @@ mod tests {
         let mut invalid = draft("ok");
         invalid.pointer.target_size.width = -1.0;
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn validates_strict_agent_messages() {
+        assert!(AgentMessage::new("Concrete answer".to_owned(), None).is_ok());
+        assert!(AgentMessage::new(" \n".to_owned(), None).is_err());
+        assert!(AgentMessage::new("answer".to_owned(), Some(" ".to_owned())).is_err());
+        assert!(AgentMessage::new("x".repeat(10_001), None).is_err());
+        assert!(AgentMessage::new("answer".to_owned(), Some("x".repeat(2_049))).is_err());
+
+        let wrong_version = serde_json::from_str::<AgentMessage>(
+            r##"{"version":2,"message":"answer","anchor":"#intro"}"##,
+        )
+        .expect("well-formed agent record");
+        assert!(wrong_version.validate().is_err());
+        assert!(
+            serde_json::from_str::<AgentMessage>(
+                r#"{"version":1,"message":"answer","unknown":true}"#
+            )
+            .is_err()
+        );
     }
 }

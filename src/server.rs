@@ -1,8 +1,10 @@
 use std::{
     borrow::Cow,
+    collections::{HashSet, VecDeque},
     convert::Infallible,
     error::Error,
     path::{Component, Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -27,13 +29,15 @@ use serde::Serialize;
 use tokio::{
     io::copy_bidirectional,
     net::TcpListener,
-    sync::watch,
+    signal::unix::{SignalKind, signal},
+    sync::{broadcast, watch},
     time::{Instant, interval_at},
 };
 use url::Url;
 
 use crate::{
     BoxError,
+    agent::{AgentEvent, AgentHub},
     fifo::CommentQueue,
     live::ReloadState,
     model::{CommentDraft, CommentRecord, MAX_REQUEST_BYTES, RequestError},
@@ -43,6 +47,7 @@ pub(crate) const RESERVED_PREFIX: &str = "/_komtar/";
 const CLIENT_PATH: &str = "/_komtar/client.js";
 const STATUS_PATH: &str = "/_komtar/api/status";
 const COMMENTS_PATH: &str = "/_komtar/api/comments";
+const MESSAGES_PATH: &str = "/_komtar/api/messages";
 const RELOAD_PATH: &str = "/_komtar/api/reload";
 const MAX_HTML_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const EDIT_SCRIPT: &[u8] = b"\n<script type=\"module\" src=\"/_komtar/client.js\"></script>\n";
@@ -54,6 +59,7 @@ type HttpClient = Client<HttpsConnector<HttpConnector>, AppBody>;
 #[derive(Clone)]
 pub(crate) struct ServerState {
     queue: CommentQueue,
+    messages: AgentHub,
     source: SourceState,
 }
 
@@ -65,7 +71,7 @@ enum SourceState {
     },
     Live {
         root: PathBuf,
-        fifo: PathBuf,
+        transport_paths: Arc<[PathBuf]>,
         resolver: Resolver,
         reload: ReloadState,
     },
@@ -78,7 +84,7 @@ enum ClientMode<'a> {
 }
 
 impl ServerState {
-    pub(crate) fn proxy(upstream: Url, queue: CommentQueue) -> Self {
+    pub(crate) fn proxy(upstream: Url, queue: CommentQueue, messages: AgentHub) -> Self {
         let connector = HttpsConnectorBuilder::new()
             .with_webpki_roots()
             .https_or_http()
@@ -87,22 +93,25 @@ impl ServerState {
         let client = Client::builder(TokioExecutor::new()).build(connector);
         Self {
             queue,
+            messages,
             source: SourceState::Proxy { upstream, client },
         }
     }
 
     pub(crate) fn live(
         root: PathBuf,
-        fifo: PathBuf,
+        transport_paths: Vec<PathBuf>,
         queue: CommentQueue,
+        messages: AgentHub,
         reload: ReloadState,
     ) -> Self {
         Self {
             queue,
+            messages,
             source: SourceState::Live {
                 resolver: Resolver::new(root.clone()),
                 root,
-                fifo,
+                transport_paths: transport_paths.into(),
                 reload,
             },
         }
@@ -110,6 +119,8 @@ impl ServerState {
 }
 
 pub(crate) async fn serve(listener: TcpListener, state: ServerState) -> Result<(), BoxError> {
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
     loop {
         tokio::select! {
             accepted = listener.accept() => {
@@ -127,12 +138,28 @@ pub(crate) async fn serve(listener: TcpListener, state: ServerState) -> Result<(
                     }
                 });
             }
-            signal = tokio::signal::ctrl_c() => {
+            signal = &mut shutdown => {
                 signal?;
                 return Ok(());
             }
         }
     }
+}
+
+async fn shutdown_signal() -> std::io::Result<()> {
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut hangup = signal(SignalKind::hangup())?;
+    let mut quit = signal(SignalKind::quit())?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result,
+        signal = terminate.recv() => received_shutdown_signal(signal),
+        signal = hangup.recv() => received_shutdown_signal(signal),
+        signal = quit.recv() => received_shutdown_signal(signal),
+    }
+}
+
+fn received_shutdown_signal(signal: Option<()>) -> std::io::Result<()> {
+    signal.ok_or_else(|| std::io::Error::other("shutdown signal handler stopped"))
 }
 
 async fn handle(
@@ -149,12 +176,12 @@ async fn handle(
             }
             SourceState::Live {
                 root,
-                fifo,
+                transport_paths,
                 resolver,
                 reload,
             } => {
                 let revision = reload.current();
-                static_request(request, root, fifo, resolver, &revision).await
+                static_request(request, root, transport_paths, resolver, &revision).await
             }
         }
     };
@@ -205,6 +232,13 @@ async fn handle_reserved(
                                 json_response(StatusCode::ACCEPTED, &PendingResponse { pending })
                             })
                     })
+            }
+        }
+        MESSAGES_PATH => {
+            if request.method() != Method::GET {
+                Err(RequestError::method_not_allowed("GET"))
+            } else {
+                Ok(agent_message_response(state.messages.clone()))
             }
         }
         RELOAD_PATH => {
@@ -338,7 +372,7 @@ async fn proxy_request(
 async fn static_request(
     request: Request<Incoming>,
     root: &Path,
-    fifo: &Path,
+    transport_paths: &[PathBuf],
     resolver: &Resolver,
     revision: &str,
 ) -> Result<Response<AppBody>, RequestError> {
@@ -346,7 +380,7 @@ async fn static_request(
     if !matches!(request_method, Method::GET | Method::HEAD) {
         return Err(RequestError::method_not_allowed("GET, HEAD"));
     }
-    match static_path_access(request.uri().path(), root, fifo).await? {
+    match static_path_access(request.uri().path(), root, transport_paths).await? {
         StaticPathAccess::Serve => {}
         StaticPathAccess::Reject(status) => return Ok(empty_response(status)),
     }
@@ -454,7 +488,7 @@ impl StaticRequestedPath {
 async fn static_path_access(
     request_path: &str,
     root: &Path,
-    fifo: &Path,
+    transport_paths: &[PathBuf],
 ) -> Result<StaticPathAccess, RequestError> {
     let requested = StaticRequestedPath::resolve(request_path);
     if has_hidden_component(&requested.path) {
@@ -464,7 +498,7 @@ async fn static_path_access(
         Ok(path) => path,
         Err(error) => return static_path_error(error, "could not verify requested static path"),
     };
-    if !path.starts_with(root) || path == fifo {
+    if !path.starts_with(root) || transport_paths.contains(&path) {
         return Ok(StaticPathAccess::Reject(StatusCode::NOT_FOUND));
     }
 
@@ -488,7 +522,7 @@ async fn static_path_access(
         Ok(index) => index,
         Err(error) => return static_path_error(error, "could not verify directory index"),
     };
-    if !index.starts_with(root) || index == fifo {
+    if !index.starts_with(root) || transport_paths.contains(&index) {
         return Ok(StaticPathAccess::Reject(StatusCode::NOT_FOUND));
     }
     let metadata = match tokio::fs::metadata(index).await {
@@ -776,6 +810,92 @@ fn reload_frame(revision: &str) -> Frame<Bytes> {
     Frame::data(Bytes::from(format!("data: {revision}\n\n")))
 }
 
+struct AgentStreamState {
+    receiver: broadcast::Receiver<Arc<AgentEvent>>,
+    hub: AgentHub,
+    pending: VecDeque<Arc<AgentEvent>>,
+    seen: HashSet<String>,
+    heartbeat: tokio::time::Interval,
+}
+
+fn agent_message_response(hub: AgentHub) -> Response<AppBody> {
+    // Subscribe before taking the snapshot. Any message racing with the snapshot is
+    // then present in at least one source, and the per-stream ID set removes duplicates.
+    let receiver = hub.subscribe();
+    let pending = hub.snapshot().into();
+    let mut heartbeat = interval_at(Instant::now() + SSE_HEARTBEAT, SSE_HEARTBEAT);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let state = AgentStreamState {
+        receiver,
+        hub,
+        pending,
+        seen: HashSet::new(),
+        heartbeat,
+    };
+    let events = stream::unfold(state, next_agent_frame);
+    let body = StreamBody::new(events)
+        .map_err(|never: Infallible| match never {})
+        .boxed_unsync();
+    let mut response = Response::new(body);
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        header::HeaderValue::from_static("text/event-stream; charset=utf-8"),
+    );
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
+    response
+        .headers_mut()
+        .insert(CONNECTION, header::HeaderValue::from_static("keep-alive"));
+    response
+}
+
+async fn next_agent_frame(
+    mut state: AgentStreamState,
+) -> Option<(Result<Frame<Bytes>, Infallible>, AgentStreamState)> {
+    loop {
+        while let Some(event) = state.pending.pop_front() {
+            if state.seen.insert(event.id.clone()) {
+                return Some((Ok(agent_frame(&event)), state));
+            }
+        }
+
+        tokio::select! {
+            received = state.receiver.recv() => {
+                match received {
+                    Ok(event) => {
+                        if state.seen.insert(event.id.clone()) {
+                            return Some((Ok(agent_frame(&event)), state));
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::debug!(skipped, "agent message subscriber lagged; refreshing snapshot");
+                        state.pending.extend(state.hub.snapshot());
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+            _ = state.heartbeat.tick() => {
+                return Some((
+                    Ok(Frame::data(Bytes::from_static(b": keep-alive\n\n"))),
+                    state,
+                ));
+            }
+        }
+    }
+}
+
+fn agent_frame(event: &AgentEvent) -> Frame<Bytes> {
+    let data = serde_json::to_vec(event).unwrap_or_else(|_| b"{}".to_vec());
+    let mut frame = Vec::with_capacity(event.id.len() + data.len() + 12);
+    frame.extend_from_slice(b"id: ");
+    frame.extend_from_slice(event.id.as_bytes());
+    frame.extend_from_slice(b"\ndata: ");
+    frame.extend_from_slice(&data);
+    frame.extend_from_slice(b"\n\n");
+    Frame::data(Bytes::from(frame))
+}
+
 #[derive(Serialize)]
 struct PendingResponse {
     pending: usize,
@@ -868,13 +988,15 @@ fn map_static_response(response: Response<hyper_staticfile::Body>) -> Response<A
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{collections::HashSet, path::PathBuf, time::Duration};
 
     use hyper::{Request, header::HOST};
 
     use super::{
-        ClientMode, StaticRequestedPath, has_hidden_component, inject_client, rewrite_redirect,
+        AgentStreamState, ClientMode, StaticRequestedPath, has_hidden_component, inject_client,
+        next_agent_frame, rewrite_redirect,
     };
+    use crate::{agent::AgentHub, model::AgentMessage};
 
     #[test]
     fn injects_before_a_case_insensitive_body_close() {
@@ -937,5 +1059,66 @@ mod tests {
             response.get(hyper::header::LOCATION).expect("location"),
             "/next"
         );
+    }
+
+    #[tokio::test]
+    async fn lagged_agent_stream_refreshes_from_recent_history() {
+        let hub = AgentHub::new();
+        let receiver = hub.subscribe();
+        for index in 0..600 {
+            hub.publish(
+                AgentMessage::new(format!("message {index}"), None).expect("valid message"),
+            );
+        }
+        let expected = hub.snapshot().first().expect("history snapshot").id.clone();
+        let heartbeat = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+        let state = AgentStreamState {
+            receiver,
+            hub,
+            pending: std::collections::VecDeque::new(),
+            seen: HashSet::new(),
+            heartbeat,
+        };
+        let Some((Ok(_frame), state)) = next_agent_frame(state).await else {
+            panic!("lag recovery frame");
+        };
+        assert!(state.seen.contains(&expected));
+    }
+
+    #[tokio::test]
+    async fn agent_stream_deduplicates_snapshot_and_live_delivery() {
+        let hub = AgentHub::new();
+        let receiver = hub.subscribe();
+        let event =
+            hub.publish(AgentMessage::new("one message".to_owned(), None).expect("valid message"));
+        let heartbeat = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_millis(10),
+            Duration::from_secs(60),
+        );
+        let state = AgentStreamState {
+            receiver,
+            pending: hub.snapshot().into(),
+            hub,
+            seen: HashSet::new(),
+            heartbeat,
+        };
+
+        let Some((Ok(first), state)) = next_agent_frame(state).await else {
+            panic!("snapshot frame");
+        };
+        let first = first.into_data().expect("snapshot data");
+        assert!(String::from_utf8_lossy(&first).contains(&event.id));
+
+        let Some((Ok(second), state)) = next_agent_frame(state).await else {
+            panic!("heartbeat frame");
+        };
+        assert_eq!(
+            second.into_data().expect("heartbeat data").as_ref(),
+            b": keep-alive\n\n"
+        );
+        assert_eq!(state.seen.len(), 1);
     }
 }

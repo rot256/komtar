@@ -45,9 +45,15 @@ impl Drop for LiveWatcher {
     }
 }
 
-pub(crate) fn start(root: &Path, fifo_path: &Path) -> Result<(LiveWatcher, ReloadState), BoxError> {
+pub(crate) fn start(
+    root: &Path,
+    transport_paths: &[PathBuf],
+) -> Result<(LiveWatcher, ReloadState), BoxError> {
     let root = root.to_owned();
-    let fifo_path = std::fs::canonicalize(fifo_path).unwrap_or_else(|_| fifo_path.to_owned());
+    let transport_paths = transport_paths
+        .iter()
+        .map(|path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned()))
+        .collect();
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let mut watcher = notify::recommended_watcher(move |event| {
         let _ = event_tx.send(event);
@@ -65,7 +71,7 @@ pub(crate) fn start(root: &Path, fifo_path: &Path) -> Result<(LiveWatcher, Reloa
     let state = ReloadState {
         revision: revision.clone(),
     };
-    let task = tokio::spawn(run_debouncer(event_rx, revision, root, fifo_path));
+    let task = tokio::spawn(run_debouncer(event_rx, revision, root, transport_paths));
     Ok((
         LiveWatcher {
             _watcher: watcher,
@@ -79,10 +85,10 @@ async fn run_debouncer(
     mut events: mpsc::UnboundedReceiver<notify::Result<Event>>,
     revision: watch::Sender<String>,
     root: PathBuf,
-    fifo_path: PathBuf,
+    transport_paths: Vec<PathBuf>,
 ) {
     while let Some(event) = events.recv().await {
-        if !should_reload(event, &root, &fifo_path) {
+        if !should_reload(event, &root, &transport_paths) {
             continue;
         }
 
@@ -104,7 +110,7 @@ async fn run_debouncer(
                         );
                         return;
                     };
-                    if should_reload(event, &root, &fifo_path) {
+                    if should_reload(event, &root, &transport_paths) {
                         deadline
                             .as_mut()
                             .reset((Instant::now() + RELOAD_DEBOUNCE).min(maximum_deadline));
@@ -116,7 +122,7 @@ async fn run_debouncer(
     tracing::warn!("filesystem watcher stopped; live reload is no longer active");
 }
 
-fn should_reload(event: notify::Result<Event>, root: &Path, fifo_path: &Path) -> bool {
+fn should_reload(event: notify::Result<Event>, root: &Path, transport_paths: &[PathBuf]) -> bool {
     let event = match event {
         Ok(event) => event,
         Err(error) => {
@@ -124,21 +130,26 @@ fn should_reload(event: notify::Result<Event>, root: &Path, fifo_path: &Path) ->
             return false;
         }
     };
-
     match event.kind {
         EventKind::Access(_) => false,
         EventKind::Any
         | EventKind::Create(_)
         | EventKind::Modify(_)
         | EventKind::Remove(_)
-        | EventKind::Other => {
-            event.paths.is_empty()
-                || event.paths.iter().any(|path| {
-                    let path = absolute_event_path(path, root);
-                    path != fifo_path && is_visible_path(&path, root)
-                })
-        }
+        | EventKind::Other => paths_trigger_reload(&event.paths, root, transport_paths),
     }
+}
+
+fn paths_trigger_reload(paths: &[PathBuf], root: &Path, transport_paths: &[PathBuf]) -> bool {
+    paths.is_empty()
+        || paths
+            .iter()
+            .any(|path| should_reload_path(path, root, transport_paths))
+}
+
+fn should_reload_path(path: &Path, root: &Path, transport_paths: &[PathBuf]) -> bool {
+    let path = absolute_event_path(path, root);
+    !transport_paths.contains(&path) && is_visible_path(&path, root)
 }
 
 fn is_visible_path(path: &Path, root: &Path) -> bool {
@@ -169,17 +180,35 @@ mod tests {
     #[test]
     fn filters_fifo_hidden_and_read_events() {
         let root = std::path::Path::new("/site");
-        let fifo = root.join(".komtar");
+        let transport_paths = [
+            root.join("feedback.pipe"),
+            root.join("feedback.pipe.send"),
+            root.join("feedback.pipe.lock"),
+        ];
         let modify = |path| Ok(Event::new(EventKind::Modify(ModifyKind::Any)).add_path(path));
 
-        assert!(!should_reload(modify(fifo.clone()), root, &fifo));
-        assert!(!should_reload(modify(root.join(".git/index")), root, &fifo));
-        assert!(should_reload(modify(root.join("index.html")), root, &fifo));
+        for path in &transport_paths {
+            assert!(!should_reload(modify(path.clone()), root, &transport_paths));
+        }
+        assert!(!should_reload(
+            modify(root.join(".git/index")),
+            root,
+            &transport_paths
+        ));
+        assert!(should_reload(
+            modify(root.join("index.html")),
+            root,
+            &transport_paths
+        ));
         assert!(!should_reload(
             Ok(Event::new(EventKind::Access(AccessKind::Read)).add_path(root.join("index.html"))),
             root,
-            &fifo,
+            &transport_paths,
         ));
-        assert!(should_reload(Ok(Event::new(EventKind::Any)), root, &fifo));
+        assert!(should_reload(
+            Ok(Event::new(EventKind::Any)),
+            root,
+            &transport_paths
+        ));
     }
 }

@@ -2,11 +2,14 @@ const BASE = new URL("./", import.meta.url);
 const COMMENTS_URL = new URL("api/comments", BASE);
 const STATUS_URL = new URL("api/status", BASE);
 const RELOAD_URL = new URL("api/reload", BASE);
+const MESSAGES_URL = new URL("api/messages", BASE);
 const LIVE_REVISION = new URL(import.meta.url).searchParams.get("live");
 const HOST_ID = "komtar";
 const MAX_SELECTED_TEXT = 2000;
 const MAX_TEXT = 4000;
 const MAX_HTML = 8000;
+const DISMISSED_KEY = "komtar-dismissed-v1";
+const AGENT_TARGET_PREFIX = "komtar-agent:";
 
 const styles = `
   :host {
@@ -58,6 +61,88 @@ const styles = `
   }
 
   #toast[hidden] { display: none; }
+
+  #agent-log { display: contents; }
+
+  #agent-general {
+    position: fixed;
+    right: 14px;
+    bottom: 52px;
+    z-index: 2147483643;
+    display: flex;
+    width: min(360px, calc(100vw - 28px));
+    max-height: calc(100vh - 66px);
+    flex-direction: column;
+    gap: 8px;
+    overflow: auto;
+    pointer-events: none;
+  }
+
+  #agent-anchored {
+    position: fixed;
+    inset: 0;
+    z-index: 2147483643;
+    pointer-events: none;
+  }
+
+  .agent-message {
+    position: relative;
+    width: min(340px, calc(100vw - 16px));
+    max-height: calc(100vh - 16px);
+    padding: 12px 34px 12px 13px;
+    border: 1px solid #45413c;
+    border-radius: 7px;
+    background: #fffdf8;
+    color: #1d1b19;
+    box-shadow: 0 6px 24px rgb(0 0 0 / 24%);
+    font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    overflow-wrap: anywhere;
+    overflow-y: auto;
+    pointer-events: auto;
+  }
+
+  #agent-anchored .agent-message { position: fixed; }
+  .agent-message p { margin: 0 0 8px; }
+  .agent-message p:last-child { margin-bottom: 0; }
+  .agent-message ul, .agent-message ol { margin: 6px 0; padding-left: 22px; }
+  .agent-message pre { overflow: auto; }
+  .agent-message code { font: inherit; background: #eeeae2; }
+  .agent-message a { color: #075f7a; text-decoration: underline; }
+
+  .agent-dismiss {
+    position: absolute;
+    top: 5px;
+    right: 5px;
+    width: 25px;
+    height: 25px;
+    padding: 0;
+    border: 0;
+    border-radius: 4px;
+    background: transparent;
+    color: #504b45;
+    font: 18px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+
+  .agent-dismiss:hover, .agent-dismiss:focus-visible { background: #eeeae2; }
+
+  .agent-unavailable {
+    margin-top: 8px;
+    color: #7b3221;
+    font-size: 11px;
+  }
+
+  .agent-unavailable[hidden] { display: none; }
+
+  #message-highlight {
+    position: fixed;
+    display: none;
+    z-index: 2147483646;
+    border: 3px solid #0b7896;
+    border-radius: 3px;
+    background: rgb(11 120 150 / 12%);
+    box-shadow: 0 0 0 3px rgb(255 255 255 / 85%);
+    pointer-events: none;
+  }
 
   dialog {
     position: fixed;
@@ -224,14 +309,14 @@ function cssSelector(target) {
   return parts.join(" > ");
 }
 
-function captureTarget(target, event) {
+function captureTarget(target, event, selector = cssSelector(target)) {
   const rect = target.getBoundingClientRect();
   return {
     element: target,
     context: {
       page: { url: window.location.href, title: document.title },
       target: {
-        selector: cssSelector(target),
+        selector,
         tag: target.tagName.toLowerCase(),
         id: target.id || null,
         classes: Array.from(target.classList),
@@ -258,6 +343,37 @@ function captureTarget(target, event) {
   };
 }
 
+function capturePageTarget() {
+  const viewport = point(window.innerWidth / 2, window.innerHeight / 2);
+  return {
+    element: null,
+    context: {
+      page: { url: window.location.href, title: document.title },
+      target: {
+        selector: "",
+        tag: "page",
+        id: null,
+        classes: [],
+        selectedText: null,
+        text: "",
+        html: "",
+      },
+      pointer: {
+        page: point(viewport.x + window.scrollX, viewport.y + window.scrollY),
+        viewport,
+        target: point(0, 0),
+        scroll: point(window.scrollX, window.scrollY),
+        viewportSize: {
+          width: roundCssPixel(window.innerWidth),
+          height: roundCssPixel(window.innerHeight),
+        },
+        targetSize: { width: 0, height: 0 },
+        devicePixelRatio: roundCssPixel(window.devicePixelRatio),
+      },
+    },
+  };
+}
+
 function responseMessage(value, fallback) {
   return value && typeof value === "object" && typeof value.error === "string"
     ? value.error
@@ -272,8 +388,13 @@ function install() {
   shadow.innerHTML = `
     <style>${styles}</style>
     <div id="highlight" aria-hidden="true"></div>
+    <div id="message-highlight" aria-hidden="true"></div>
     <div id="badge" role="status" aria-live="polite">0 queued</div>
     <div id="toast" role="status" aria-live="polite" hidden></div>
+    <div id="agent-log" role="log" aria-live="polite" aria-relevant="additions">
+      <div id="agent-general"></div>
+      <div id="agent-anchored"></div>
+    </div>
     <dialog id="komtar-dialog" aria-labelledby="dialog-label">
       <form>
         <label id="dialog-label" for="comment">Suggest Edit:</label>
@@ -296,9 +417,13 @@ function install() {
   document.body.append(host);
 
   const highlight = shadow.querySelector("#highlight");
+  const messageHighlight = shadow.querySelector("#message-highlight");
   const badge = shadow.querySelector("#badge");
   const toast = shadow.querySelector("#toast");
+  const agentGeneral = shadow.querySelector("#agent-general");
+  const agentAnchored = shadow.querySelector("#agent-anchored");
   const dialog = shadow.querySelector("dialog");
+  const dialogLabel = shadow.querySelector("#dialog-label");
   const form = shadow.querySelector("form");
   const selectionPreview = shadow.querySelector("#selection-preview");
   const selectionText = shadow.querySelector("#selection-text");
@@ -308,7 +433,8 @@ function install() {
   const cancel = shadow.querySelector("#cancel");
   const send = shadow.querySelector("#send");
   if (
-    !highlight || !badge || !toast || !dialog || !form || !selectionPreview ||
+    !highlight || !messageHighlight || !badge || !toast || !agentGeneral ||
+    !agentAnchored || !dialog || !dialogLabel || !form || !selectionPreview ||
     !selectionText || !textarea || !status || !reloadNotice || !cancel || !send
   ) {
     host.remove();
@@ -319,6 +445,17 @@ function install() {
   let toastTimer;
   let pendingReload = false;
   let reloadRevision = LIVE_REVISION;
+  let placementFrame;
+  let messageHighlightTimer;
+  const agentMessages = new Map();
+  const dismissed = (() => {
+    try {
+      const stored = JSON.parse(sessionStorage.getItem(DISMISSED_KEY) ?? "[]");
+      return new Set(Array.isArray(stored) ? stored.filter((id) => typeof id === "string") : []);
+    } catch {
+      return new Set();
+    }
+  })();
 
   const setPending = (pending) => {
     badge.textContent = `${pending} queued`;
@@ -332,8 +469,195 @@ function install() {
     toastTimer = setTimeout(() => { toast.hidden = true; }, 2400);
   };
 
+  const persistDismissed = () => {
+    try {
+      sessionStorage.setItem(DISMISSED_KEY, JSON.stringify(Array.from(dismissed)));
+    } catch {
+      // Dismissal remains active for this document if storage is unavailable.
+    }
+  };
+
+  const targetForSelector = (selector) => {
+    if (selector.startsWith(AGENT_TARGET_PREFIX)) {
+      const id = selector.slice(AGENT_TARGET_PREFIX.length);
+      return agentMessages.get(id)?.node ?? null;
+    }
+    return document.querySelector(selector);
+  };
+
+  const anchorTarget = (anchor) => {
+    if (anchor === null) return null;
+    try {
+      const target = targetForSelector(anchor);
+      if (!target || target === host || target.getClientRects().length === 0) return undefined;
+      return target;
+    } catch {
+      return undefined;
+    }
+  };
+
+  const placeAgentMessages = () => {
+    placementFrame = undefined;
+    const anchoredGroups = new Map();
+    for (const entry of agentMessages.values()) {
+      const target = anchorTarget(entry.anchor);
+      if (target instanceof Element) {
+        entry.unavailable.hidden = true;
+        if (entry.node.parentElement !== agentAnchored) agentAnchored.append(entry.node);
+        const group = anchoredGroups.get(target) ?? [];
+        group.push(entry.node);
+        anchoredGroups.set(target, group);
+      } else {
+        entry.unavailable.hidden = entry.anchor === null;
+        if (entry.node.parentElement !== agentGeneral) agentGeneral.append(entry.node);
+        entry.node.style.removeProperty("left");
+        entry.node.style.removeProperty("top");
+      }
+    }
+
+    const gap = 8;
+    const edge = 8;
+    for (const [target, nodes] of anchoredGroups) {
+      const rect = target.getBoundingClientRect();
+      const heights = nodes.map((node) => node.offsetHeight);
+      const totalHeight = heights.reduce((total, height) => total + height, 0) +
+        gap * Math.max(0, nodes.length - 1);
+      let top = Math.max(edge, Math.min(rect.top, window.innerHeight - totalHeight - edge));
+      for (const [index, node] of nodes.entries()) {
+        const width = node.offsetWidth;
+        const height = heights[index] ?? 0;
+        const rightSide = rect.right + gap;
+        const preferredLeft = rightSide + width <= window.innerWidth - edge
+          ? rightSide
+          : rect.left - width - gap;
+        const left = Math.max(edge, Math.min(preferredLeft, window.innerWidth - width - edge));
+        const clampedTop = Math.max(edge, Math.min(top, window.innerHeight - height - edge));
+        node.style.left = `${left}px`;
+        node.style.top = `${clampedTop}px`;
+        top = clampedTop + height + gap;
+      }
+    }
+  };
+
+  const scheduleAgentPlacement = () => {
+    if (placementFrame !== undefined) return;
+    placementFrame = requestAnimationFrame(placeAgentMessages);
+  };
+
+  const showMessageHighlight = (target) => {
+    const rect = target.getBoundingClientRect();
+    messageHighlight.style.display = "block";
+    messageHighlight.style.left = `${rect.left}px`;
+    messageHighlight.style.top = `${rect.top}px`;
+    messageHighlight.style.width = `${rect.width}px`;
+    messageHighlight.style.height = `${rect.height}px`;
+    if (messageHighlightTimer) clearTimeout(messageHighlightTimer);
+    messageHighlightTimer = setTimeout(() => {
+      messageHighlight.style.display = "none";
+    }, 1800);
+  };
+
+  const followElementLink = (link, event) => {
+    const href = link.getAttribute("href") ?? "";
+    if (!href.toLowerCase().startsWith("komtar:")) return false;
+    event.preventDefault();
+    let selector;
+    try {
+      selector = decodeURIComponent(href.slice("komtar:".length));
+    } catch {
+      showToast("Element link is invalid");
+      return true;
+    }
+    let target;
+    try {
+      target = targetForSelector(selector);
+    } catch {
+      target = null;
+    }
+    if (!target) {
+      showToast("Element is unavailable");
+      return true;
+    }
+    target.scrollIntoView({ block: "center", inline: "nearest" });
+    requestAnimationFrame(() => showMessageHighlight(target));
+    return true;
+  };
+
+  const addAgentMessage = (data) => {
+    if (
+      !data || typeof data !== "object" || typeof data.id !== "string" ||
+      typeof data.html !== "string" ||
+      !(data.anchor === undefined || typeof data.anchor === "string") ||
+      dismissed.has(data.id) || agentMessages.has(data.id)
+    ) return;
+
+    const node = document.createElement("article");
+    node.className = "agent-message";
+    node.dataset.messageId = data.id;
+    const close = document.createElement("button");
+    close.className = "agent-dismiss";
+    close.type = "button";
+    close.setAttribute("aria-label", "Dismiss agent message");
+    close.textContent = "×";
+    const body = document.createElement("div");
+    body.className = "agent-body";
+    body.innerHTML = data.html;
+    const unavailable = document.createElement("div");
+    unavailable.className = "agent-unavailable";
+    unavailable.textContent = "Target unavailable";
+    unavailable.hidden = true;
+    node.append(close, body, unavailable);
+
+    for (const link of body.querySelectorAll("a")) {
+      const href = link.getAttribute("href") ?? "";
+      if (!href.toLowerCase().startsWith("komtar:")) {
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+      }
+    }
+    body.addEventListener("click", (event) => {
+      const link = event.target instanceof Element ? event.target.closest("a") : null;
+      if (link) followElementLink(link, event);
+    });
+    close.addEventListener("click", () => {
+      dismissed.add(data.id);
+      persistDismissed();
+      agentMessages.delete(data.id);
+      node.remove();
+      scheduleAgentPlacement();
+    });
+    agentMessages.set(data.id, {
+      node,
+      unavailable,
+      anchor: typeof data.anchor === "string" ? data.anchor : null,
+    });
+    scheduleAgentPlacement();
+  };
+
+  window.addEventListener("resize", scheduleAgentPlacement);
+  window.addEventListener("scroll", scheduleAgentPlacement, true);
+  const placementObserver = new MutationObserver(scheduleAgentPlacement);
+  placementObserver.observe(document.documentElement, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    characterData: true,
+  });
+
+  const messageEvents = new EventSource(MESSAGES_URL);
+  messageEvents.addEventListener("message", (event) => {
+    try {
+      addAgentMessage(JSON.parse(event.data));
+    } catch {
+      // Ignore malformed events and leave the stream connected.
+    }
+  });
+
   const updateHighlight = () => {
-    if (!captured || !dialog.open || !captured.element.isConnected) {
+    if (
+      !captured || !dialog.open || !(captured.element instanceof Element) ||
+      !captured.element.isConnected
+    ) {
       highlight.style.display = "none";
       return;
     }
@@ -370,12 +694,13 @@ function install() {
     dialog.style.top = `${Math.max(gap, Math.min(y + gap, window.innerHeight - height - gap))}px`;
   };
 
-  const openDialog = (target, event) => {
+  const showDialog = (nextCapture, x, y, label) => {
     if (dialog.open) {
       textarea.focus();
       return;
     }
-    captured = captureTarget(target, event);
+    captured = nextCapture;
+    dialogLabel.textContent = label;
     const selectedText = captured.context.target.selectedText;
     selectionPreview.hidden = selectedText === null;
     selectionText.textContent = selectedText ?? "";
@@ -383,11 +708,29 @@ function install() {
     reloadNotice.hidden = !pendingReload;
     textarea.value = "";
     dialog.showModal();
-    placeDialog(event.clientX, event.clientY);
+    placeDialog(x, y);
     updateHighlight();
     window.addEventListener("resize", updateHighlight);
     window.addEventListener("scroll", updateHighlight, true);
     textarea.focus();
+  };
+
+  const openDialog = (
+    target,
+    event,
+    selector = cssSelector(target),
+    label = "Suggest Edit:",
+  ) => {
+    showDialog(captureTarget(target, event, selector), event.clientX, event.clientY, label);
+  };
+
+  const openPageDialog = () => {
+    showDialog(
+      capturePageTarget(),
+      window.innerWidth / 2,
+      window.innerHeight / 3,
+      "Comment:",
+    );
   };
 
   document.addEventListener("contextmenu", (event) => {
@@ -395,6 +738,36 @@ function install() {
     if (!(event.target instanceof Element)) return;
     event.preventDefault();
     openDialog(event.target, event);
+  }, true);
+
+  shadow.addEventListener("contextmenu", (event) => {
+    if (event.shiftKey) return;
+    const target = event.composedPath().find(
+      (node) => node instanceof Element && node.classList.contains("agent-message"),
+    );
+    if (!(target instanceof HTMLElement) || !target.dataset.messageId) return;
+    event.preventDefault();
+    event.stopPropagation();
+    openDialog(
+      target,
+      event,
+      `${AGENT_TARGET_PREFIX}${target.dataset.messageId}`,
+      "Comment on agent response:",
+    );
+  }, true);
+
+  document.addEventListener("keydown", (event) => {
+    if (
+      event.defaultPrevented || event.isComposing || event.key !== "/" ||
+      event.metaKey || event.ctrlKey || event.altKey
+    ) return;
+    const editing = event.composedPath().some(
+      (node) => node instanceof HTMLElement &&
+        (node.isContentEditable || node.matches("input, textarea, select")),
+    );
+    if (editing) return;
+    event.preventDefault();
+    openPageDialog();
   }, true);
 
   form.addEventListener("submit", (event) => {

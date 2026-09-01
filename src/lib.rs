@@ -1,16 +1,25 @@
+mod agent;
 mod fifo;
 mod live;
 mod model;
 mod server;
 
-use std::{error::Error, io, net::SocketAddr, path::PathBuf, str::FromStr};
+use std::{
+    error::Error,
+    io::{self, Read, Write},
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 
 use clap::{Parser, Subcommand};
 use tokio::net::TcpListener;
 use url::Url;
 
 use crate::{
-    fifo::{CommentQueue, ensure_fifo},
+    agent::{AgentHub, InboxTask},
+    fifo::{CommentQueue, ServerTransport},
+    model::AgentMessage,
     server::ServerState,
 };
 
@@ -51,7 +60,7 @@ impl FromStr for UpstreamUrl {
     version,
     about = "Serve or proxy development sites and queue browser feedback",
     arg_required_else_help = true,
-    after_help = "Workflow:\n  1. Run Komtar and open the printed URL.\n  2. Ask your agent to read .komtar.\n  3. Right-click the page and suggest edits.\n\nThe agent reads the FIFO. You point at the page and tell it what to change."
+    after_help = "Workflow:\n  1. Run Komtar and open the printed URL.\n  2. Ask your agent to run `komtar recv`.\n  3. Right-click the page and suggest edits.\n\nRun `komtar agent` for the complete agent workflow."
 )]
 pub struct Cli {
     /// Address on which komtar accepts browser requests.
@@ -83,6 +92,19 @@ enum Command {
         /// Directory containing the site to serve.
         directory: PathBuf,
     },
+
+    /// Wait for and print one batch of browser feedback.
+    Recv,
+
+    /// Send a Markdown answer to connected browsers.
+    Send {
+        /// CSS selector beside which the answer should appear.
+        #[arg(long)]
+        anchor: Option<String>,
+    },
+
+    /// Print the agent workflow.
+    Agent,
 }
 
 #[derive(Debug)]
@@ -130,6 +152,9 @@ impl TryFrom<Cli> for RunConfig {
                 }
                 Source::Serve(directory)
             }
+            (None, Some(Command::Recv | Command::Send { .. } | Command::Agent)) => {
+                return Err("helper commands do not start a server".into());
+            }
             (None, None) => return Err("provide an upstream URL or a subcommand".into()),
             (Some(_), Some(_)) => {
                 return Err("the legacy upstream URL cannot be combined with a subcommand".into());
@@ -144,6 +169,36 @@ impl TryFrom<Cli> for RunConfig {
 }
 
 pub async fn run(cli: Cli) -> Result<(), BoxError> {
+    if cli.upstream.is_some()
+        && matches!(
+            cli.command.as_ref(),
+            Some(Command::Recv | Command::Send { .. } | Command::Agent)
+        )
+    {
+        return Err("the legacy upstream URL cannot be combined with a helper command".into());
+    }
+    match &cli.command {
+        Some(Command::Recv) => {
+            let batch = fifo::receive_batch(&cli.fifo)?;
+            io::stdout().write_all(&batch)?;
+            io::stdout().flush()?;
+            return Ok(());
+        }
+        Some(Command::Send { anchor }) => {
+            let mut message = String::new();
+            io::stdin().read_to_string(&mut message)?;
+            let input = AgentMessage::new(message, anchor.clone())
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+            agent::send_message(&cli.fifo, input)?;
+            return Ok(());
+        }
+        Some(Command::Agent) => {
+            print!("{}", agent::agent_guidance()?);
+            return Ok(());
+        }
+        Some(Command::Proxy { .. } | Command::Serve { .. }) | None => {}
+    }
+
     let RunConfig {
         listen,
         fifo: fifo_path,
@@ -157,26 +212,29 @@ pub async fn run(cli: Cli) -> Result<(), BoxError> {
         )
     })?;
     let listen = listener.local_addr()?;
-    let fifo = ensure_fifo(&fifo_path)?;
+    let transport = ServerTransport::create(&fifo_path)?;
+    let transport_paths = transport.paths().clone();
     let queue = CommentQueue::new();
-    queue.start_delivery(fifo.clone());
+    let delivery = queue.start_delivery(transport_paths.clone());
+    let messages = AgentHub::new();
+    let inbox = InboxTask::start(transport.open_send_reader()?, messages.clone());
 
     let (state, mode_message, live_watcher) = match source {
         Source::Proxy(upstream) => (
-            ServerState::proxy(upstream.clone(), queue),
+            ServerState::proxy(upstream.clone(), queue, messages),
             format!("proxying {upstream}"),
             None,
         ),
         Source::Serve(directory) => {
-            let live_fifo = std::fs::canonicalize(&fifo).map_err(|error| {
+            let excluded_paths = transport_paths.canonical().map_err(|error| {
                 io::Error::new(
                     error.kind(),
-                    format!("could not resolve FIFO {}: {error}", fifo.display()),
+                    format!("could not resolve transport paths: {error}"),
                 )
             })?;
-            let (watcher, reload) = live::start(&directory, &live_fifo)?;
+            let (watcher, reload) = live::start(&directory, &excluded_paths)?;
             (
-                ServerState::live(directory.clone(), live_fifo, queue, reload),
+                ServerState::live(directory.clone(), excluded_paths, queue, messages, reload),
                 format!("serving {} with live reload", directory.display()),
                 Some(watcher),
             )
@@ -185,10 +243,22 @@ pub async fn run(cli: Cli) -> Result<(), BoxError> {
 
     let base_url = format!("http://{listen}");
     println!("komtar: {mode_message} at {base_url}");
-    println!("komtar: FIFO {}", fifo.display());
-    println!("komtar: read comments with: cat {}", fifo.display());
+    println!("komtar: FIFO {}", transport_paths.receive.display());
+    if fifo_path == Path::new(".komtar") {
+        println!("komtar: receive feedback with: komtar recv");
+    } else {
+        println!(
+            "komtar: receive feedback with: komtar recv --fifo {}",
+            fifo_path.display()
+        );
+    }
 
-    let result = server::serve(listener, state).await;
+    let result = tokio::select! {
+        result = server::serve(listener, state) => result,
+        error = transport.wait_until_broken() => Err(error.into()),
+    };
+    drop(inbox);
+    drop(delivery);
     drop(live_watcher);
     result
 }
@@ -287,7 +357,7 @@ mod tests {
     #[test]
     fn help_explains_the_agent_workflow() {
         let help = Cli::command().render_long_help().to_string();
-        assert!(help.contains("Ask your agent to read .komtar"));
-        assert!(help.contains("The agent reads the FIFO"));
+        assert!(help.contains("komtar recv"));
+        assert!(help.contains("komtar agent"));
     }
 }
