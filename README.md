@@ -77,6 +77,8 @@ printf 'Use the shorter heading.' | komtar send --anchor '#intro'
 General answers stack above the Komtar badge. Anchored answers appear beside
 the matching element and fall back to a general “Target unavailable” card
 until that element exists. Markdown is rendered and sanitized by the server.
+Click an anchored answer—or focus it and press Enter or Space—to scroll to and
+highlight its target.
 Comments on agent answers carry an opaque `komtar-agent:` target selector;
 passing that selector back to `send --anchor` attaches the requested answer to
 the original response. Page-level comments opened with `/` have a blank target

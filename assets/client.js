@@ -108,6 +108,11 @@ const styles = `
   .agent-message pre { overflow: auto; }
   .agent-message code { font: inherit; background: #eeeae2; }
   .agent-message a { color: #075f7a; text-decoration: underline; }
+  .agent-message.has-anchor { cursor: pointer; }
+  .agent-message.has-anchor:focus-visible {
+    outline: 3px solid #287088;
+    outline-offset: 2px;
+  }
 
   .agent-dismiss {
     position: absolute;
@@ -517,6 +522,47 @@ function install() {
 
     const gap = 8;
     const edge = 8;
+    const occupied = Array.from(agentGeneral.children).map((node) => {
+      const rect = node.getBoundingClientRect();
+      return {
+        left: rect.left,
+        right: rect.right,
+        top: rect.top,
+        bottom: rect.bottom,
+      };
+    });
+    const overlapsOccupied = (candidate) => occupied.some((rect) => !(
+      candidate.right + gap <= rect.left ||
+      candidate.left >= rect.right + gap ||
+      candidate.bottom + gap <= rect.top ||
+      candidate.top >= rect.bottom + gap
+    ));
+    const availablePlacement = (rect, width, height, desiredTop) => {
+      const maximumLeft = window.innerWidth - width - edge;
+      const right = Math.max(edge, Math.min(rect.right + gap, maximumLeft));
+      const left = Math.max(edge, Math.min(rect.left - width - gap, maximumLeft));
+      const horizontal = rect.right + gap + width <= window.innerWidth - edge
+        ? [right, left]
+        : [left, right];
+      const maximumTop = window.innerHeight - height - edge;
+      const vertical = [
+        desiredTop,
+        ...occupied.flatMap((placed) => [
+          placed.bottom + gap,
+          placed.top - height - gap,
+        ]),
+      ].map((top) => Math.max(edge, Math.min(top, maximumTop)));
+      const candidates = horizontal.flatMap((candidateLeft, side) =>
+        vertical.map((candidateTop) => ({
+          left: candidateLeft,
+          right: candidateLeft + width,
+          top: candidateTop,
+          bottom: candidateTop + height,
+          score: Math.abs(candidateTop - desiredTop) * 2 + side,
+        })))
+        .sort((first, second) => first.score - second.score);
+      return candidates.find((candidate) => !overlapsOccupied(candidate)) ?? candidates[0];
+    };
     for (const [target, nodes] of anchoredGroups) {
       const rect = target.getBoundingClientRect();
       const heights = nodes.map((node) => node.offsetHeight);
@@ -526,15 +572,11 @@ function install() {
       for (const [index, node] of nodes.entries()) {
         const width = node.offsetWidth;
         const height = heights[index] ?? 0;
-        const rightSide = rect.right + gap;
-        const preferredLeft = rightSide + width <= window.innerWidth - edge
-          ? rightSide
-          : rect.left - width - gap;
-        const left = Math.max(edge, Math.min(preferredLeft, window.innerWidth - width - edge));
-        const clampedTop = Math.max(edge, Math.min(top, window.innerHeight - height - edge));
-        node.style.left = `${left}px`;
-        node.style.top = `${clampedTop}px`;
-        top = clampedTop + height + gap;
+        const placement = availablePlacement(rect, width, height, top);
+        node.style.left = `${placement.left}px`;
+        node.style.top = `${placement.top}px`;
+        occupied.push(placement);
+        top = placement.bottom + gap;
       }
     }
   };
@@ -557,6 +599,21 @@ function install() {
     }, 1800);
   };
 
+  const revealTarget = (selector) => {
+    let target;
+    try {
+      target = targetForSelector(selector);
+    } catch {
+      target = null;
+    }
+    if (!target || target.getClientRects().length === 0) {
+      showToast("Element is unavailable");
+      return;
+    }
+    target.scrollIntoView({ block: "center", inline: "nearest" });
+    requestAnimationFrame(() => showMessageHighlight(target));
+  };
+
   const followElementLink = (link, event) => {
     const href = link.getAttribute("href") ?? "";
     if (!href.toLowerCase().startsWith("komtar:")) return false;
@@ -568,18 +625,7 @@ function install() {
       showToast("Element link is invalid");
       return true;
     }
-    let target;
-    try {
-      target = targetForSelector(selector);
-    } catch {
-      target = null;
-    }
-    if (!target) {
-      showToast("Element is unavailable");
-      return true;
-    }
-    target.scrollIntoView({ block: "center", inline: "nearest" });
-    requestAnimationFrame(() => showMessageHighlight(target));
+    revealTarget(selector);
     return true;
   };
 
@@ -607,6 +653,25 @@ function install() {
     unavailable.textContent = "Target unavailable";
     unavailable.hidden = true;
     node.append(close, body, unavailable);
+    const anchor = typeof data.anchor === "string" ? data.anchor : null;
+    if (anchor !== null) {
+      node.classList.add("has-anchor");
+      node.tabIndex = 0;
+      node.setAttribute("aria-label", "Agent message; activate to show its anchor");
+      node.addEventListener("click", (event) => {
+        const interactive = event.target instanceof Element
+          ? event.target.closest("a, button")
+          : null;
+        const selection = window.getSelection();
+        if (interactive || (selection && !selection.isCollapsed)) return;
+        revealTarget(anchor);
+      });
+      node.addEventListener("keydown", (event) => {
+        if (event.target !== node || !["Enter", " "].includes(event.key)) return;
+        event.preventDefault();
+        revealTarget(anchor);
+      });
+    }
 
     for (const link of body.querySelectorAll("a")) {
       const href = link.getAttribute("href") ?? "";
@@ -629,7 +694,7 @@ function install() {
     agentMessages.set(data.id, {
       node,
       unavailable,
-      anchor: typeof data.anchor === "string" ? data.anchor : null,
+      anchor,
     });
     scheduleAgentPlacement();
   };

@@ -890,6 +890,24 @@ def test_anchored_stacking_missing_anchor_reattachment_and_element_links(
             )
             assert in_view is True
 
+            expect(first).to_have_attribute("tabindex", "0")
+            first.click()
+            expect(page.locator("#komtar #message-highlight")).to_be_visible()
+            intro_in_view = page.locator("#intro").evaluate(
+                "node => { const rect = node.getBoundingClientRect(); "
+                "return rect.top >= 0 && rect.bottom <= innerHeight; }"
+            )
+            assert intro_in_view is True
+
+            page.get_by_role("link", name="Jump to the complex target").click()
+            second.focus()
+            second.press("Enter")
+            intro_in_view = page.locator("#intro").evaluate(
+                "node => { const rect = node.getBoundingClientRect(); "
+                "return rect.top >= 0 && rect.bottom <= innerHeight; }"
+            )
+            assert intro_in_view is True
+
             send_message(fifo, "Invalid anchor answer", "[")
             invalid_anchor = page.locator(
                 "#komtar .agent-message", has_text="Invalid anchor answer"
