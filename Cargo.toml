@@ -1,6 +1,6 @@
 [package]
 name = "komtar"
-version = "0.3.1"
+version = "0.3.0"
 edition = "2024"
 description = "Development static server and reverse proxy for queuing browser feedback"
 license = "MIT"
