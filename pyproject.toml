@@ -6,10 +6,10 @@ dependencies = []
 
 [dependency-groups]
 dev = [
-  "basedpyright>=1.39.10",
-  "playwright>=1.55",
+  "basedpyright>=1.40.1",
+  "playwright>=1.63.0",
   "pytest>=8.4",
-  "ruff>=0.16.5",
+  "ruff>=0.16.8",
 ]
 
 [tool.pytest.ini_options]
