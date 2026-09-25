@@ -58,6 +58,7 @@ fn companion_path(path: &Path, suffix: &str) -> PathBuf {
 
 struct OwnedPath {
     path: PathBuf,
+    kind: TransportKind,
     device: u64,
     inode: u64,
 }
@@ -99,21 +100,33 @@ impl OwnedPath {
         }
         Ok(Self {
             path,
+            kind,
             device: metadata.dev(),
             inode: metadata.ino(),
         })
     }
 
+    // Linux can hand a freed inode number straight to a replacement file, so
+    // the device and inode alone do not identify the path we created.
+    fn is_same(&self, metadata: &fs::Metadata) -> bool {
+        let Self {
+            path: _,
+            kind,
+            device,
+            inode,
+        } = self;
+        metadata.dev() == *device && metadata.ino() == *inode && kind.matches(metadata)
+    }
+
     fn is_unchanged(&self) -> bool {
-        fs::symlink_metadata(&self.path)
-            .is_ok_and(|metadata| metadata.dev() == self.device && metadata.ino() == self.inode)
+        fs::symlink_metadata(&self.path).is_ok_and(|metadata| self.is_same(&metadata))
     }
 
     fn remove_if_unchanged(&self) {
         let Ok(metadata) = fs::symlink_metadata(&self.path) else {
             return;
         };
-        if metadata.dev() != self.device || metadata.ino() != self.inode {
+        if !self.is_same(&metadata) {
             tracing::warn!(path = %self.path.display(), "transport path changed; leaving it in place");
             return;
         }
@@ -549,7 +562,7 @@ fn absolute_path(path: &Path) -> io::Result<PathBuf> {
 mod tests {
     use std::{
         fs, io,
-        os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt, symlink},
+        os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt, symlink},
         thread,
         time::{Duration, Instant},
     };
@@ -560,8 +573,8 @@ mod tests {
     use crate::model::{CommentRecord, PageContext, Point, PointerContext, Size, TargetContext};
 
     use super::{
-        AdvisoryLock, CommentQueue, ServerTransport, TransportPaths, ensure_fifo, ensure_lock_file,
-        is_reader_absent, receive_batch, write_nonblocking,
+        AdvisoryLock, CommentQueue, OwnedPath, ServerTransport, TransportKind, TransportPaths,
+        ensure_fifo, ensure_lock_file, is_reader_absent, receive_batch, write_nonblocking,
     };
 
     #[derive(Deserialize)]
@@ -641,6 +654,27 @@ mod tests {
         assert!(!paths.receive.exists());
         assert!(!paths.send.exists());
         assert!(!paths.lock.exists());
+    }
+
+    #[test]
+    fn treats_a_reused_inode_with_another_type_as_replaced() {
+        let temporary = tempdir().expect("temp directory");
+        let path = temporary.path().join("feedback.pipe");
+        fs::write(&path, "replacement owned by the user").expect("write fixture");
+        let metadata = fs::symlink_metadata(&path).expect("fixture metadata");
+        // Simulate a FIFO whose inode number was reused by the regular file.
+        let owned = OwnedPath {
+            path: path.clone(),
+            kind: TransportKind::Fifo,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
+        assert!(!owned.is_unchanged());
+        owned.remove_if_unchanged();
+        assert_eq!(
+            fs::read_to_string(path).expect("replacement survives"),
+            "replacement owned by the user"
+        );
     }
 
     #[test]
