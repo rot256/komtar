@@ -11,6 +11,10 @@ on:
 permissions:
   contents: read
 
+env:
+  # Fail every compile step, including release builds, on any warning.
+  RUSTFLAGS: -D warnings
+
 jobs:
   metadata:
     name: Read release version
