@@ -771,6 +771,30 @@ def test_global_shortcut_and_comments_on_agent_responses(page: Page) -> None:
                 "height": 0,
             }
 
+            selected_text = page.locator("h1").evaluate(
+                """(element) => {
+                  const range = document.createRange();
+                  range.selectNodeContents(element);
+                  const selection = window.getSelection();
+                  selection.removeAllRanges();
+                  selection.addRange(range);
+                  return selection.toString();
+                }"""
+            )
+            page.keyboard.press("/")
+            expect(dialog).to_be_visible()
+            expect(page.locator("#komtar #selection-text")).to_have_text(selected_text)
+            page.locator("#komtar textarea").fill("A question about the selected text")
+            page.locator("#komtar textarea").press("Enter")
+            expect(dialog).to_be_hidden()
+
+            delivered = run_cli("recv", "--fifo", str(fifo))
+            assert delivered.returncode == 0, delivered.stderr
+            selection_record = json.loads(delivered.stdout)
+            assert selection_record["comment"] == "A question about the selected text"
+            assert selection_record["target"]["selector"] == ""
+            assert selection_record["target"]["selectedText"] == selected_text
+
             send_message(fifo, "Initial agent response")
             initial = page.locator(
                 "#komtar .agent-message", has_text="Initial agent response"

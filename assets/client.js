@@ -359,7 +359,7 @@ function capturePageTarget() {
         tag: "page",
         id: null,
         classes: [],
-        selectedText: null,
+        selectedText: selectedTextFor(document.documentElement),
         text: "",
         html: "",
       },
